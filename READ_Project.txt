@@ -1,0 +1,20 @@
+We will have to install "clang, compiler-rt" along with LLVM to install clang with AddressSanitizer.
+
+************************* INSTALLATION STEPS  *************************
+
+1. cd llvm-project
+
+2. mkdir build
+
+3. cd build
+
+4. cmake -G -DLLVM_ENABLE_PROJECTS="clang,compiler-rt" [options] ../llvm
+
+5. make -j N 				(N is the number of cores to perform a serial build)
+
+
+************************* TO RUN CLANG ************************
+
+1. cd llvm-project/build/bin
+
+2. ./clang -fsanitize=address $FILE_NAME
