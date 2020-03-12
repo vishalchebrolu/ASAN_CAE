@@ -697,8 +697,10 @@ private:
   Value *LocalDynamicShadow = nullptr;
   const GlobalsMetadata &GlobalsMD;
   DenseMap<const AllocaInst *, bool> ProcessedAllocas;
+
   DenseMap< Value*, Value*> ArraytoArraySize;
   DenseMap< Type*, Value*> GarbageTypetoValue;
+  SmallVector<SmallVector<Value*, 8>, 8> EqualPointers;
 };
 
 class AddressSanitizerLegacyPass : public FunctionPass {
@@ -1644,9 +1646,9 @@ Instruction *AddressSanitizer::generateCrashCode(Instruction *InsertBefore,
 
 Value* getArrayIndex(GetElementPtrInst* Inst) {
   if(isa<StructType>(Inst->getResultElementType())) {
-    return NULL;
+    return NULL;                                                      //Don't intervene with struct getelementptr instructions
   }
-  for(auto idx = Inst->idx_begin(); idx != Inst->idx_end(); idx++)    //Assuming getelementptr has a single index
+  for(auto idx = Inst->idx_begin(); idx != Inst->idx_end(); idx++)    //Assuming getelementptr has a single index for now
   {
     return dyn_cast<Value>(*idx);
   }
@@ -1665,12 +1667,7 @@ void InsertPhiInst(Value* ArrayIdx, BasicBlock* RecoverBlock, Value* OriginalArr
       PHINd->addIncoming(OriginalArrayIdx, pred);
     }
   }
-  //OriginalArrayIdx->replaceUsesOutsideBlock(PHINd,InsertBefore->getParent());
-  /*
-  StoreInst* SI = new StoreInst(cast<StoreInst>(InsertBefore)->getValueOperand(), PHINd);
-  SI->setAlignment(Align(cast<StoreInst>(InsertBefore)->getAlignment()));
-  ReplaceInstWithInst(InsertBefore,SI);
-  */
+  
   cast<User>(InsertBefore)->setOperand(1,PHINd);          //arrayidx is used only in these instruction after the PHI inst
   
 
@@ -1679,7 +1676,10 @@ void InsertPhiInst(Value* ArrayIdx, BasicBlock* RecoverBlock, Value* OriginalArr
 
 Value* AddressSanitizer::generateRecoverCode(Instruction* RecoverTerm, BasicBlock* NextNextBlock, Instruction* InsertBefore, bool IsWrite) {
   Value* StartAddr = NULL, *index = NULL, *OriginalArrayIdx = NULL;
+  
   if(IsWrite) {
+    //Pointer analysis to get the start address of the array and the accessed index from 'getelementptr' instruction
+    //printf("INTO WRITE\n");
     for(Use &StoreU : InsertBefore->operands()) {
       Value *v = StoreU.get();
       if(GetElementPtrInst* Inst = dyn_cast<GetElementPtrInst>(v)) {
@@ -1696,10 +1696,12 @@ Value* AddressSanitizer::generateRecoverCode(Instruction* RecoverTerm, BasicBloc
           } 
         }
         index = getArrayIndex(Inst);
-        if(!OriginalArrayIdx || !StartAddr || !index)
-          return NULL;
       }
     }
+    if(!OriginalArrayIdx || !StartAddr || !index)
+        return NULL;
+
+    //Recovery IR code generation for WRITE access
     Type* Ty = Type::getInt32Ty(*C);
     Module* M = RecoverTerm->getModule();
     const DataLayout &DL = M->getDataLayout();
@@ -1726,6 +1728,7 @@ Value* AddressSanitizer::generateRecoverCode(Instruction* RecoverTerm, BasicBloc
     StoreInst* StrSize = IRB.CreateStore(SizeCheck, ArraySizeVal);
     StrSize->setAlignment(DL.getABIIntegerTypeAlignment(Ty->getIntegerBitWidth()));
 
+
     ArraySize = IRB.CreateLoad(Type::getInt32Ty(*C), ArraySizeVal);
     //ArraySize->setAlignment(DL.getABIIntegerTypeAlignment(ArraySize->getType()->getIntegerBitWidth()));
 
@@ -1739,7 +1742,7 @@ Value* AddressSanitizer::generateRecoverCode(Instruction* RecoverTerm, BasicBloc
     Value* MallocSize = ArraySize;
     if(ArrayElementSize != 1)  
       MallocSize= IRB.CreateMul(ArraySize,ConstantInt::get(Type::getInt64Ty(*C),ArrayElementSize));
-    
+
     Value* ArrayAddr = IRB.CreateLoad(cast<PointerType>(StartAddr->getType())->getElementType(), StartAddr);
     //ArrayAddr->setAlignment(DL.getABIIntegerTypeAlignment(ArrayAddr->getType()->getIntegerBitWidth()));
 
@@ -1758,7 +1761,20 @@ Value* AddressSanitizer::generateRecoverCode(Instruction* RecoverTerm, BasicBloc
     }
     
     IRB.CreateStore(ReallocCall, StartAddr);      //create the store
-    //errs() << "StartAddr ty: " << StartAddr->getType()->getTypeID() << "\n";
+    //Create the store for every pointer which is alias of the reallocated pointer
+    for(size_t i = 0;i < EqualPointers.size();i++) {
+      for(auto *iter = EqualPointers[i].begin(); iter != EqualPointers[i].end(); iter++) {
+        if(*iter == StartAddr) {
+          for(auto it = EqualPointers[i].begin(); it != EqualPointers[i].end(); it++) {
+            if(*it != StartAddr) {
+              IRB.CreateStore(ReallocCall, *it);
+              break;
+            }
+          }
+        }
+      }
+    }
+    
     //StrArr->setAlignment(DL.getABIIntegerTypeAlignment(ReallocCall->getType()->getIntegerBitWidth()));
     ArrayAddr = IRB.CreateLoad(StartAddrTy, StartAddr);
     //ArrayAddr->setAlignment(DL.getABIIntegerTypeAlignment(ArrayAddr->getType()->getIntegerBitWidth()));
@@ -1769,24 +1785,28 @@ Value* AddressSanitizer::generateRecoverCode(Instruction* RecoverTerm, BasicBloc
     Value* ArrayIdx = IRB.CreateInBoundsGEP(ArrayAddr, {index});
 
     InsertPhiInst(ArrayIdx, RecoverBlock, OriginalArrayIdx, InsertBefore);
-
     return ArrayIdx;
   }
   else {
+    //printf("Into READ\n");]
     IRBuilder<> IRB(InsertBefore);
+    // Recovery IR code generation for READ access
     Value* ArrayAddr = cast<LoadInst>(InsertBefore)->getPointerOperand();
     Type* ArrayAddrTy = ArrayAddr->getType();
     Type* ArrayElementTy = ArrayAddrTy->getPointerElementType();
-    PHINode* PHINd = IRB.CreatePHI(ArrayAddrTy, 3);
-    for(BasicBlock *pred : predecessors(InsertBefore->getParent())) {
-      if(pred == RecoverTerm->getParent()) {
-        PHINd->addIncoming(GarbageTypetoValue[ArrayElementTy], RecoverTerm->getParent());
+    
+    if(GarbageTypetoValue.find(ArrayElementTy) != GarbageTypetoValue.end()) {
+      PHINode* PHINd = IRB.CreatePHI(ArrayAddrTy, 3);
+      for(BasicBlock *pred : predecessors(InsertBefore->getParent())) {
+        if(pred == RecoverTerm->getParent()) {
+          PHINd->addIncoming(GarbageTypetoValue[ArrayElementTy], RecoverTerm->getParent());
+        }
+        else {
+          PHINd->addIncoming(ArrayAddr, pred);
+        }
       }
-      else {
-        PHINd->addIncoming(ArrayAddr, pred);
-      }
+      cast<User>(InsertBefore)->setOperand(0,PHINd); 
     }
-    cast<User>(InsertBefore)->setOperand(0,PHINd);
   }
   return NULL; 
 }
@@ -2837,6 +2857,7 @@ bool AddressSanitizer::instrumentFunction(Function &F,
       Value *MaybeMask = nullptr;
       if (Value *Addr = isInterestingMemoryAccess(&Inst, &IsWrite, &TypeSize,
                                                   &Alignment, &MaybeMask)) {
+        
         if (ClOpt && ClOptSameTemp) {
           // If we have a mask, skip instrumentation if we've already
           // instrumented the full object. But don't add to TempsToInstrument
@@ -2855,7 +2876,43 @@ bool AddressSanitizer::instrumentFunction(Function &F,
                   isInterestingPointerSubtraction(&Inst))) {
         PointerComparisonsOrSubtracts.push_back(&Inst);
         continue;
-      } else if (isa<MemIntrinsic>(Inst)) {
+      } else if(StoreInst* SI = dyn_cast<StoreInst>(&Inst)) {
+        //WORKING ONLY FOR STRONG UPDATES
+        SI->getOperand(0);
+        if(PointerType* srcPtrTy = dyn_cast<PointerType>(src->getType())) {   //Code to handle pointer aliasing of the array start address
+          if(!srcPtrTy->getElementType()->isPointerTy()) {                    // To not handle 2D pointer aliasing
+            Value* Dest = SI->getPointerOperand();
+            for(Use &U : SI->operands()) {
+              Value* v = U.get();
+              if(LoadInst* LI = dyn_cast<LoadInst>(v)) {                      //If the use is from a load instruction indicates its a pointer aliasing
+                Value* V = LI->getPointerOperand();
+                bool found = 0;
+                for(size_t i = 0; i < EqualPointers.size();i++) {             // Place the pointers aliased in a 2D vector to indicate they are the same
+                  for(auto it = EqualPointers[i].begin(); it != EqualPointers[i].end();it++) {
+                    if(*it == Dest) {                                         // Remove any past aliases of the same pointer in the 2D vector
+                      EqualPointers[i].erase(it);
+                      break;
+                    }
+                    else if(*it == V) {
+                      EqualPointers[i].push_back(Dest);
+                      found = 1;
+                      break;
+                    }
+                  }
+                }
+                if(!found) {
+                  SmallVector<Value*, 8> TempVec;
+                  TempVec.push_back(Dest);
+                  TempVec.push_back(V);
+                  EqualPointers.push_back(TempVec);
+                }
+              }
+            } 
+          } 
+        }
+        continue;
+      }
+      else if (isa<MemIntrinsic>(Inst)) {
         // ok, take it.
       } else {
         if (isa<AllocaInst>(Inst)) NumAllocas++;
@@ -2878,8 +2935,8 @@ bool AddressSanitizer::instrumentFunction(Function &F,
              while(II) {
                 for(User* U : II->users()) {                        //only one user is present
                   if(StoreInst* SI = dyn_cast<StoreInst>(U)) {
-                    ArrayAddr = SI->getPointerOperand();
-                    Name = ArrayAddr->getName();
+                    ArrayAddr = SI->getPointerOperand();            // A Value* to the start of the array
+                    Name = ArrayAddr->getName();                    // Name of the array
                     II = NULL;
                     break;
                   }
@@ -2887,7 +2944,7 @@ bool AddressSanitizer::instrumentFunction(Function &F,
                   II = UI;
                 }
              }
-             AllocaInst* AI = IRB.CreateAlloca(Ty, nullptr, Name + ".size");
+             AllocaInst* AI = IRB.CreateAlloca(Ty, nullptr, Name + ".size");      // Create an alloca for size holder
              AI->setAlignment(DL.getABIIntegerTypeAlignment(Ty->getIntegerBitWidth()));
              ArraytoArraySize[ArrayAddr] = dyn_cast<Value>(AI);       //Insert into map for retrieval
              
@@ -2898,13 +2955,13 @@ bool AddressSanitizer::instrumentFunction(Function &F,
               uint64_t ArrayElementSize = DL.getTypeStoreSize(ArrayElementTy);
 
               uint64_t ArraySize = MallocSize / ArrayElementSize;
-              //errs() << "MallocSize: " << MallocSize << "\n" ;
-              //errs() << "ArrayElementSize: " << ArrayElementSize << "\n";
               StoreInst* SizeSI = IRB.CreateStore(ConstantInt::get(Ty,ArraySize),AI);
               SizeSI->setAlignment(DL.getABIIntegerTypeAlignment(Ty->getIntegerBitWidth()));
              }
+             //Should add code to handle if the array size is not a constant int
 
              int primitiveSize = (ArrayElementTy->getPrimitiveSizeInBits()).getFixedSize();
+             //Creating Garbage Pointers of different types
              if(primitiveSize && (GarbageTypetoValue.find(ArrayElementTy) == GarbageTypetoValue.end())) {
                std::string name = "";
                Value* InitVal = NULL;
@@ -2929,13 +2986,15 @@ bool AddressSanitizer::instrumentFunction(Function &F,
                 name = "double";
                 InitVal = ConstantFP::get(Type::getDoubleTy(*C), 0.0);
                }
-               
+
+              //Create the corresponding garbage pointer 
               AllocaInst* Garbage_AI = IRB.CreateAlloca(ArrayElementTy, nullptr, "garbage." + name);
               Garbage_AI->setAlignment(DL.getABIIntegerTypeAlignment(primitiveSize));
+              //Store the null value of the specific type into the garbage value.
               StoreInst* Garbage_SI = IRB.CreateStore(InitVal, Garbage_AI);
               Garbage_SI->setAlignment(DL.getABIIntegerTypeAlignment(primitiveSize));
               GarbageTypetoValue[ArrayElementTy] = cast<Value>(Garbage_AI);
-             }
+            }
           }
           maybeMarkSanitizerLibraryCallNoBuiltin(CI, TLI);
         }
@@ -2960,7 +3019,7 @@ bool AddressSanitizer::instrumentFunction(Function &F,
   for (auto Inst : ToInstrument) {
     if (ClDebugMin < 0 || ClDebugMax < 0 ||
         (NumInstrumented >= ClDebugMin && NumInstrumented <= ClDebugMax)) {
-      if (isInterestingMemoryAccess(Inst, &IsWrite, &TypeSize, &Alignment))
+      if (isInterestingMemoryAccess(Inst, &IsWrite, &TypeSize, &Alignment)) 
         instrumentMop(ObjSizeVis, Inst, UseCalls,
                       F.getParent()->getDataLayout());
       else
