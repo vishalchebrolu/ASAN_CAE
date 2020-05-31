@@ -178,6 +178,15 @@ static const char *const kAsanShadowMemoryDynamicAddress =
 static const char *const kAsanAllocaPoison = "__asan_alloca_poison";
 static const char *const kAsanAllocasUnpoison = "__asan_allocas_unpoison";
 
+// Name for recover
+static const std::string kAsanRecover = "recvr";
+// Name for globals created by recover
+static const char *const kAsanRecoverGlobalsName = "recvr.str";
+// Struct Types of trie node and index element
+StructType* TrieNodeTy = nullptr, *IndexElementTy = nullptr;
+// Function Pointers for the new functions
+//Function* getNode = nullptr, *insertFunc = nullptr, *getIndexFunc = nullptr;
+
 // Accesses sizes are powers of two: 1, 2, 4, 8, 16.
 static const size_t kNumberOfAccessSizes = 5;
 
@@ -579,167 +588,6 @@ private:
 
 char ASanGlobalsMetadataWrapperPass::ID = 0;
 
-/// AddressSanitizer: instrument the code in module to find memory bugs.
-struct AddressSanitizer {
-  AddressSanitizer(Module &M, const GlobalsMetadata *GlobalsMD,
-                   bool CompileKernel = false, bool Recover = false,
-                   bool UseAfterScope = false)
-      : UseAfterScope(UseAfterScope || ClUseAfterScope), GlobalsMD(*GlobalsMD) {
-    this->Recover = ClRecover.getNumOccurrences() > 0 ? ClRecover : Recover;
-    this->CompileKernel =
-        ClEnableKasan.getNumOccurrences() > 0 ? ClEnableKasan : CompileKernel;
-
-    C = &(M.getContext());
-    LongSize = M.getDataLayout().getPointerSizeInBits();
-    IntptrTy = Type::getIntNTy(*C, LongSize);
-    TargetTriple = Triple(M.getTargetTriple());
-
-    Mapping = getShadowMapping(TargetTriple, LongSize, this->CompileKernel);
-  }
-
-  uint64_t getAllocaSizeInBytes(const AllocaInst &AI) const {
-    uint64_t ArraySize = 1;
-    if (AI.isArrayAllocation()) {
-      const ConstantInt *CI = dyn_cast<ConstantInt>(AI.getArraySize());
-      assert(CI && "non-constant array size");
-      ArraySize = CI->getZExtValue();
-    }
-    Type *Ty = AI.getAllocatedType();
-    uint64_t SizeInBytes =
-        AI.getModule()->getDataLayout().getTypeAllocSize(Ty);
-    return SizeInBytes * ArraySize;
-  }
-
-  /// Check if we want (and can) handle this alloca.
-  bool isInterestingAlloca(const AllocaInst &AI);
-
-  /// If it is an interesting memory access, return the PointerOperand
-  /// and set IsWrite/Alignment. Otherwise return nullptr.
-  /// MaybeMask is an output parameter for the mask Value, if we're looking at a
-  /// masked load/store.
-  Value *isInterestingMemoryAccess(Instruction *I, bool *IsWrite,
-                                   uint64_t *TypeSize, unsigned *Alignment,
-                                   Value **MaybeMask = nullptr);
-
-  void instrumentMop(ObjectSizeOffsetVisitor &ObjSizeVis, Instruction *I,
-                     bool UseCalls, const DataLayout &DL);
-  void instrumentPointerComparisonOrSubtraction(Instruction *I);
-  void instrumentAddress(Instruction *OrigIns, Instruction *InsertBefore,
-                         Value *Addr, uint32_t TypeSize, bool IsWrite,
-                         Value *SizeArgument, bool UseCalls, uint32_t Exp);
-  void instrumentUnusualSizeOrAlignment(Instruction *I,
-                                        Instruction *InsertBefore, Value *Addr,
-                                        uint32_t TypeSize, bool IsWrite,
-                                        Value *SizeArgument, bool UseCalls,
-                                        uint32_t Exp);
-  Value *createSlowPathCmp(IRBuilder<> &IRB, Value *AddrLong,
-                           Value *ShadowValue, uint32_t TypeSize);
-  Instruction *generateCrashCode(Instruction *InsertBefore, Value *Addr,
-                                 bool IsWrite, size_t AccessSizeIndex,
-                                 Value *SizeArgument, uint32_t Exp);
-  Value* generateRecoverCode(Instruction* RecoverTerm, BasicBlock* NextNextBlock, 
-                            Instruction* InsertBefore, bool IsWrite);
-  void instrumentMemIntrinsic(MemIntrinsic *MI);
-  Value *memToShadow(Value *Shadow, IRBuilder<> &IRB);
-  bool instrumentFunction(Function &F, const TargetLibraryInfo *TLI);
-  bool maybeInsertAsanInitAtFunctionEntry(Function &F);
-  void maybeInsertDynamicShadowAtFunctionEntry(Function &F);
-  void markEscapedLocalAllocas(Function &F);
-
-private:
-  friend struct FunctionStackPoisoner;
-
-  void initializeCallbacks(Module &M);
-
-  bool LooksLikeCodeInBug11395(Instruction *I);
-  bool GlobalIsLinkerInitialized(GlobalVariable *G);
-  bool isSafeAccess(ObjectSizeOffsetVisitor &ObjSizeVis, Value *Addr,
-                    uint64_t TypeSize) const;
-
-  /// Helper to cleanup per-function state.
-  struct FunctionStateRAII {
-    AddressSanitizer *Pass;
-
-    FunctionStateRAII(AddressSanitizer *Pass) : Pass(Pass) {
-      assert(Pass->ProcessedAllocas.empty() &&
-             "last pass forgot to clear cache");
-      assert(!Pass->LocalDynamicShadow);
-    }
-
-    ~FunctionStateRAII() {
-      Pass->LocalDynamicShadow = nullptr;
-      Pass->ProcessedAllocas.clear();
-    }
-  };
-
-  LLVMContext *C;
-  Triple TargetTriple;
-  int LongSize;
-  bool CompileKernel;
-  bool Recover;
-  bool UseAfterScope;
-  Type *IntptrTy;
-  ShadowMapping Mapping;
-  FunctionCallee AsanHandleNoReturnFunc;
-  FunctionCallee AsanPtrCmpFunction, AsanPtrSubFunction;
-  Constant *AsanShadowGlobal;
-
-  // These arrays is indexed by AccessIsWrite, Experiment and log2(AccessSize).
-  FunctionCallee AsanErrorCallback[2][2][kNumberOfAccessSizes];
-  FunctionCallee AsanMemoryAccessCallback[2][2][kNumberOfAccessSizes];
-
-  // These arrays is indexed by AccessIsWrite and Experiment.
-  FunctionCallee AsanErrorCallbackSized[2][2];
-  FunctionCallee AsanMemoryAccessCallbackSized[2][2];
-
-  FunctionCallee AsanMemmove, AsanMemcpy, AsanMemset;
-  InlineAsm *EmptyAsm;
-  Value *LocalDynamicShadow = nullptr;
-  const GlobalsMetadata &GlobalsMD;
-  DenseMap<const AllocaInst *, bool> ProcessedAllocas;
-
-  DenseMap< Value*, Value*> ArraytoArraySize;
-  DenseMap< Type*, Value*> GarbageTypetoValue;
-  SmallVector<SmallVector<Value*, 8>, 8> EqualPointers;
-};
-
-class AddressSanitizerLegacyPass : public FunctionPass {
-public:
-  static char ID;
-
-  explicit AddressSanitizerLegacyPass(bool CompileKernel = false,
-                                      bool Recover = false,
-                                      bool UseAfterScope = false)
-      : FunctionPass(ID), CompileKernel(CompileKernel), Recover(Recover),
-        UseAfterScope(UseAfterScope) {
-    initializeAddressSanitizerLegacyPassPass(*PassRegistry::getPassRegistry());
-  }
-
-  StringRef getPassName() const override {
-    return "AddressSanitizerFunctionPass";
-  }
-
-  void getAnalysisUsage(AnalysisUsage &AU) const override {
-    AU.addRequired<ASanGlobalsMetadataWrapperPass>();
-    AU.addRequired<TargetLibraryInfoWrapperPass>();
-  }
-
-  bool runOnFunction(Function &F) override {
-    GlobalsMetadata &GlobalsMD =
-        getAnalysis<ASanGlobalsMetadataWrapperPass>().getGlobalsMD();
-    const TargetLibraryInfo *TLI =
-        &getAnalysis<TargetLibraryInfoWrapperPass>().getTLI(F);
-    AddressSanitizer ASan(*F.getParent(), &GlobalsMD, CompileKernel, Recover,
-                          UseAfterScope);
-    return ASan.instrumentFunction(F, TLI);
-  }
-
-private:
-  bool CompileKernel;
-  bool Recover;
-  bool UseAfterScope;
-};
-
 class ModuleAddressSanitizer {
 public:
   ModuleAddressSanitizer(Module &M, const GlobalsMetadata *GlobalsMD,
@@ -829,6 +677,33 @@ private:
   Function *AsanDtorFunction = nullptr;
 };
 
+class ModuleTrieFunctionsPass : public ModulePass {
+public:
+  static char ID;
+
+  ModuleTrieFunctionsPass() : ModulePass(ID) {}
+
+  bool runOnModule(Module &M) override {
+    createRecoverTypesnFuncs(M);
+    return true;
+  }
+
+private:
+  void CreateInitializeIndicesFunction(Module &M, StructType* TrieNode, StructType* IndexElement);
+
+  void CreateFreeFunction(Module &M, StructType* TrieNode, StructType* IndexElement);
+
+  void CreateSetReallocFunction(Module &M, StructType* TrieNode, StructType* IndexElement);
+
+  void CreateGetNodeFunction(Module &M, StructType* TrieNode);
+
+  void CreateInsertTrieFunction(Module &M, StructType* TrieNode, StructType* IndexElement);
+
+  void CreateGetIndexFunction(Module &M, StructType* TrieNode, StructType* IndexElement);
+
+  void createRecoverTypesnFuncs(Module &M);
+};
+
 class ModuleAddressSanitizerLegacyPass : public ModulePass {
 public:
   static char ID;
@@ -854,6 +729,7 @@ public:
         getAnalysis<ASanGlobalsMetadataWrapperPass>().getGlobalsMD();
     ModuleAddressSanitizer ASanModule(M, &GlobalsMD, CompileKernel, Recover,
                                       UseGlobalGC, UseOdrIndicator);
+
     return ASanModule.instrumentModule(M);
   }
 
@@ -862,6 +738,200 @@ private:
   bool Recover;
   bool UseGlobalGC;
   bool UseOdrIndicator;
+};
+
+void InitializeRecoverStructTypes(Module &M, StructType** TrieNodeTyAddr, StructType** IndexElementTyAddr, bool writeMode) {
+  SmallVector<Type*, 4> MemberTy;
+  LLVMContext *C = &(M.getContext());
+  if(writeMode) {
+    TrieNodeTy = StructType::create(*C, kAsanRecover + ".struct.TrieNode");
+    ArrayType* ChildMemberTy = ArrayType::get(PointerType::get(TrieNodeTy, 0), 63);
+    IntegerType* IntegerTy = Type::getInt32Ty(*C);
+    MemberTy.push_back(ChildMemberTy);
+    MemberTy.push_back(IntegerTy);
+    TrieNodeTy->setBody(MemberTy);
+    MemberTy.pop_back();
+    MemberTy.pop_back();
+
+    MemberTy.push_back(IntegerTy);
+    MemberTy.push_back(IntegerTy);
+    MemberTy.push_back(PointerType::get(Type::getInt8PtrTy(*C), 0));
+    IndexElementTy = StructType::create(*C, ArrayRef<Type*>(MemberTy), kAsanRecover + ".struct.IndexElement");
+  }
+  *TrieNodeTyAddr = TrieNodeTy;
+  *IndexElementTyAddr = IndexElementTy;
+  return;
+}
+
+/// AddressSanitizer: instrument the code in module to find memory bugs.
+struct AddressSanitizer {
+  AddressSanitizer(Module &M, const GlobalsMetadata *GlobalsMD,
+                   bool CompileKernel = false, bool Recover = false,
+                   bool UseAfterScope = false)
+      : UseAfterScope(UseAfterScope || ClUseAfterScope), GlobalsMD(*GlobalsMD) {
+    this->Recover = ClRecover.getNumOccurrences() > 0 ? ClRecover : Recover;
+    this->CompileKernel =
+        ClEnableKasan.getNumOccurrences() > 0 ? ClEnableKasan : CompileKernel;
+
+    C = &(M.getContext());
+    LongSize = M.getDataLayout().getPointerSizeInBits();
+    IntptrTy = Type::getIntNTy(*C, LongSize);
+    TargetTriple = Triple(M.getTargetTriple());
+
+    //InitializeRecoverStructTypes(M, &TrieNodeTy, &IndexElementTy, /* Write mode */ 0);
+    //CreateTrieLibFunctions(M, TrieNodeTy, IndexElementTy);
+    Mapping = getShadowMapping(TargetTriple, LongSize, this->CompileKernel);
+  }
+
+  uint64_t getAllocaSizeInBytes(const AllocaInst &AI) const {
+    uint64_t ArraySize = 1;
+    if (AI.isArrayAllocation()) {
+      const ConstantInt *CI = dyn_cast<ConstantInt>(AI.getArraySize());
+      assert(CI && "non-constant array size");
+      ArraySize = CI->getZExtValue();
+    }
+    Type *Ty = AI.getAllocatedType();
+    uint64_t SizeInBytes =
+        AI.getModule()->getDataLayout().getTypeAllocSize(Ty);
+    return SizeInBytes * ArraySize;
+  }
+
+  /// Check if we want (and can) handle this alloca.
+  bool isInterestingAlloca(const AllocaInst &AI);
+
+  /// If it is an interesting memory access, return the PointerOperand
+  /// and set IsWrite/Alignment. Otherwise return nullptr.
+  /// MaybeMask is an output parameter for the mask Value, if we're looking at a
+  /// masked load/store.
+  Value *isInterestingMemoryAccess(Instruction *I, bool *IsWrite,
+                                   uint64_t *TypeSize, unsigned *Alignment,
+                                   Value **MaybeMask = nullptr);
+
+  void instrumentMop(ObjectSizeOffsetVisitor &ObjSizeVis, Instruction *I,
+                     bool UseCalls, const DataLayout &DL);
+  void instrumentPointerComparisonOrSubtraction(Instruction *I);
+  void instrumentAddress(Instruction *OrigIns, Instruction *InsertBefore,
+                         Value *Addr, uint32_t TypeSize, bool IsWrite,
+                         Value *SizeArgument, bool UseCalls, uint32_t Exp);
+  void instrumentUnusualSizeOrAlignment(Instruction *I,
+                                        Instruction *InsertBefore, Value *Addr,
+                                        uint32_t TypeSize, bool IsWrite,
+                                        Value *SizeArgument, bool UseCalls,
+                                        uint32_t Exp);
+  Value *createSlowPathCmp(IRBuilder<> &IRB, Value *AddrLong,
+                           Value *ShadowValue, uint32_t TypeSize);
+  Instruction *generateCrashCode(Instruction *InsertBefore, Value *Addr,
+                                 bool IsWrite, size_t AccessSizeIndex,
+                                 Value *SizeArgument, uint32_t Exp);
+  Value* generateRecoverCode(Instruction* RecoverTerm, BasicBlock* NextNextBlock, 
+                            Instruction* InsertBefore, bool IsWrite);
+  void instrumentMemIntrinsic(MemIntrinsic *MI);
+  Value *memToShadow(Value *Shadow, IRBuilder<> &IRB);
+  bool instrumentFunction(Function &F, const TargetLibraryInfo *TLI);
+  bool maybeInsertAsanInitAtFunctionEntry(Function &F);
+  void maybeInsertDynamicShadowAtFunctionEntry(Function &F);
+  void markEscapedLocalAllocas(Function &F);
+  //friend void InitializeRecoverStructTypes(Module &M, StructType** TrieNodeTy, StructType** IndexElementTy);
+
+private:
+  friend struct FunctionStackPoisoner;
+
+  void initializeCallbacks(Module &M);
+
+  bool LooksLikeCodeInBug11395(Instruction *I);
+  bool GlobalIsLinkerInitialized(GlobalVariable *G);
+  bool isSafeAccess(ObjectSizeOffsetVisitor &ObjSizeVis, Value *Addr,
+                    uint64_t TypeSize) const;
+
+  /// Helper to cleanup per-function state.
+  struct FunctionStateRAII {
+    AddressSanitizer *Pass;
+
+    FunctionStateRAII(AddressSanitizer *Pass) : Pass(Pass) {
+      assert(Pass->ProcessedAllocas.empty() &&
+             "last pass forgot to clear cache");
+      assert(!Pass->LocalDynamicShadow);
+    }
+
+    ~FunctionStateRAII() {
+      Pass->LocalDynamicShadow = nullptr;
+      Pass->ProcessedAllocas.clear();
+    }
+  };
+
+  LLVMContext *C;
+  Triple TargetTriple;
+  int LongSize;
+  bool CompileKernel;
+  bool Recover;
+  bool UseAfterScope;
+  Type *IntptrTy;
+  ShadowMapping Mapping;
+  FunctionCallee AsanHandleNoReturnFunc;
+  FunctionCallee AsanPtrCmpFunction, AsanPtrSubFunction;
+  Constant *AsanShadowGlobal;
+
+  // These arrays is indexed by AccessIsWrite, Experiment and log2(AccessSize).
+  FunctionCallee AsanErrorCallback[2][2][kNumberOfAccessSizes];
+  FunctionCallee AsanMemoryAccessCallback[2][2][kNumberOfAccessSizes];
+
+  // These arrays is indexed by AccessIsWrite and Experiment.
+  FunctionCallee AsanErrorCallbackSized[2][2];
+  FunctionCallee AsanMemoryAccessCallbackSized[2][2];
+
+  FunctionCallee AsanMemmove, AsanMemcpy, AsanMemset;
+  InlineAsm *EmptyAsm;
+  Value *LocalDynamicShadow = nullptr;
+  const GlobalsMetadata &GlobalsMD;
+  DenseMap<const AllocaInst *, bool> ProcessedAllocas;
+
+  DenseMap< Value*, Value*> ArraytoArraySize;
+  DenseMap< Type*, Value*> GarbageTypetoValue;
+  SmallVector<SmallVector<Value*, 8>, 8> EqualPointers;
+  std::map<StringRef, GlobalValue*> namesOfPointers;
+  AllocaInst* TrieHead;
+  AllocaInst* IndicesArr;
+  StructType* TrieNodeTy;
+  StructType* IndexElementTy;
+  int oneLvlPointerCount;
+};
+
+class AddressSanitizerLegacyPass : public FunctionPass {
+public:
+  static char ID;
+
+  explicit AddressSanitizerLegacyPass(bool CompileKernel = false,
+                                      bool Recover = false,
+                                      bool UseAfterScope = false)
+      : FunctionPass(ID), CompileKernel(CompileKernel), Recover(Recover),
+        UseAfterScope(UseAfterScope) {
+    initializeAddressSanitizerLegacyPassPass(*PassRegistry::getPassRegistry());
+  }
+
+  StringRef getPassName() const override {
+    return "AddressSanitizerFunctionPass";
+  }
+
+  void getAnalysisUsage(AnalysisUsage &AU) const override {
+    AU.addRequired<ASanGlobalsMetadataWrapperPass>();
+    AU.addRequired<TargetLibraryInfoWrapperPass>();
+    AU.addRequired<ModuleTrieFunctionsPass>();
+  }
+
+  bool runOnFunction(Function &F) override {
+    GlobalsMetadata &GlobalsMD =
+        getAnalysis<ASanGlobalsMetadataWrapperPass>().getGlobalsMD();
+    const TargetLibraryInfo *TLI =
+        &getAnalysis<TargetLibraryInfoWrapperPass>().getTLI(F);
+    AddressSanitizer ASan(*F.getParent(), &GlobalsMD, CompileKernel, Recover,
+                          UseAfterScope);
+    return ASan.instrumentFunction(F, TLI);
+  }
+
+private:
+  bool CompileKernel;
+  bool Recover;
+  bool UseAfterScope;
 };
 
 // Stack poisoning does not play well with exception handling.
@@ -1214,12 +1284,20 @@ INITIALIZE_PASS(ASanGlobalsMetadataWrapperPass, "asan-globals-md",
 
 char AddressSanitizerLegacyPass::ID = 0;
 
+void initializeModuleTrieFunctionsPassPass(PassRegistry &Registry)
+{
+  static RegisterPass<ModuleTrieFunctionsPass> X("ModuleTrieFunctionsPass", "AddressSanitizer: add trie functions",
+                                              false, false);
+  return;
+}
+
 INITIALIZE_PASS_BEGIN(
     AddressSanitizerLegacyPass, "asan",
     "AddressSanitizer: detects use-after-free and out-of-bounds bugs.", false,
     false)
 INITIALIZE_PASS_DEPENDENCY(ASanGlobalsMetadataWrapperPass)
 INITIALIZE_PASS_DEPENDENCY(TargetLibraryInfoWrapperPass)
+INITIALIZE_PASS_DEPENDENCY(ModuleTrieFunctionsPass)
 INITIALIZE_PASS_END(
     AddressSanitizerLegacyPass, "asan",
     "AddressSanitizer: detects use-after-free and out-of-bounds bugs.", false,
@@ -1246,6 +1324,8 @@ ModulePass *llvm::createModuleAddressSanitizerLegacyPassPass(
   return new ModuleAddressSanitizerLegacyPass(CompileKernel, Recover,
                                               UseGlobalsGC, UseOdrIndicator);
 }
+
+char ModuleTrieFunctionsPass::ID = 0;
 
 static size_t TypeSizeToSizeIndex(uint32_t TypeSize) {
   size_t Res = countTrailingZeros(TypeSize / 8);
@@ -1342,6 +1422,8 @@ bool AddressSanitizer::isInterestingAlloca(const AllocaInst &AI) {
        !AI.isUsedWithInAlloca() &&
        // swifterror allocas are register promoted by ISel
        !AI.isSwiftError() &&
+       // ignore allocas created for recvr
+       !AI.getName().startswith(kAsanRecover) &&
        //ignore allocas created for garbage reads
        !(cast<Value>(AI).getName()).startswith("garbage."));
 
@@ -1679,7 +1761,7 @@ Value* AddressSanitizer::generateRecoverCode(Instruction* RecoverTerm, BasicBloc
   
   if(IsWrite) {
     //Pointer analysis to get the start address of the array and the accessed index from 'getelementptr' instruction
-    //printf("INTO WRITE\n");
+    printf("INTO WRITE\n");
     for(Use &StoreU : InsertBefore->operands()) {
       Value *v = StoreU.get();
       if(GetElementPtrInst* Inst = dyn_cast<GetElementPtrInst>(v)) {
@@ -1705,8 +1787,44 @@ Value* AddressSanitizer::generateRecoverCode(Instruction* RecoverTerm, BasicBloc
     Type* Ty = Type::getInt32Ty(*C);
     Module* M = RecoverTerm->getModule();
     const DataLayout &DL = M->getDataLayout();
-    Value* ArraySizeVal = ArraytoArraySize[StartAddr];
     IRBuilder<> IRB(RecoverTerm);
+
+    PointerType* TrieNodePtrTy = PointerType::get(TrieNodeTy, 0);
+    PointerType* IndexElmPtrTy = PointerType::get(IndexElementTy, 0);
+    FunctionCallee getIndexFunc = M->getOrInsertFunction(kAsanRecover + ".getIndex", 
+                                                         Type::getInt32Ty(*C), 
+                                                         TrieNodePtrTy, 
+                                                         Type::getInt8PtrTy(*C));
+    FunctionCallee setReallocFunc = M->getOrInsertFunction(kAsanRecover + ".setRealloc",
+                                                            Type::getVoidTy(*C),
+                                                            IndexElmPtrTy,
+                                                            Type::getInt32Ty(*C),
+                                                            Type::getInt32Ty(*C),
+                                                            Type::getInt8PtrTy(*C));
+    StringRef ArrayName = StartAddr->getName();
+    SmallVector<Value*, 4> Args;
+    Value* TrieHeadVal = IRB.CreateLoad(TrieNodePtrTy, TrieHead);
+    Args.push_back(TrieHeadVal);
+    Args.push_back(IRB.CreateGEP(namesOfPointers[ArrayName], {ConstantInt::get(Type::getInt64Ty(*C), 0), ConstantInt::get(Type::getInt64Ty(*C), 0)}));
+    Value* arrayIndex = IRB.CreateCall(getIndexFunc, ArrayRef<Value*>(Args));
+
+    Value* parentIdxPtr = IRB.CreateGEP(IndicesArr, {arrayIndex, ConstantInt::get(Type::getInt32Ty(*C), 0)});
+    Value* parentIdx = IRB.CreateLoad(Type::getInt32Ty(*C), parentIdxPtr);
+    Value* isUnAddr = IRB.CreateICmpSLT(parentIdx, ConstantInt::getSigned(Type::getInt32Ty(*C), -1));
+
+
+    BasicBlock* NextBB = InsertBefore->getParent();
+    BasicBlock* Recovery = BasicBlock::Create(*C, "", NextBB->getParent(), NextBB);
+    BasicBlock* MulSize = BasicBlock::Create(*C, "", NextBB->getParent(), Recovery);
+
+    IRB.CreateCondBr(isUnAddr, NextNextBlock, MulSize);
+    RecoverTerm->eraseFromParent();
+
+    IRB.SetInsertPoint(MulSize);
+    Value* isEqual = IRB.CreateICmpEQ(parentIdx, ConstantInt::getSigned(Type::getInt32Ty(*C), -1));
+    Value* selectVal = IRB.CreateSelect(isEqual, arrayIndex, parentIdx);
+
+    Value* ArraySizeVal = IRB.CreateGEP(IndicesArr, {selectVal, ConstantInt::get(Type::getInt32Ty(*C), 1)});
     Value* ArraySize = IRB.CreateLoad(Type::getInt32Ty(*C), ArraySizeVal);
     //ArraySize->setAlignment(DL.getABIIntegerTypeAlignment(ArraySize->getType()->getIntegerBitWidth()));
     
@@ -1715,19 +1833,18 @@ Value* AddressSanitizer::generateRecoverCode(Instruction* RecoverTerm, BasicBloc
        index = IRB.CreateTrunc(index, Type::getInt32Ty(*C));
     }
     Value* SizeCheck = IRB.CreateMul(ArraySize, ConstantInt::get(Type::getInt32Ty(*C),2));
-    Value* Cmp = IRB.CreateICmpSLE(index, SizeCheck);
+    Value* Cmp = IRB.CreateICmpSLT(index, SizeCheck);
+    IRB.CreateCondBr(Cmp, Recovery, NextNextBlock);
     
-    BasicBlock* NextBB = InsertBefore->getParent();
-    BasicBlock* Recovery = BasicBlock::Create(*C, "", NextBB->getParent(), NextBB);
     Instruction* CheckTerm = BranchInst::Create(NextBB, Recovery);
+    /*
     BranchInst* CmpBrInst = BranchInst::Create(Recovery, NextNextBlock, Cmp);
     ReplaceInstWithInst(RecoverTerm, CmpBrInst);
-
+    */
     IRB.SetInsertPoint(CheckTerm);
     BasicBlock* RecoverBlock = CheckTerm->getParent();
     StoreInst* StrSize = IRB.CreateStore(SizeCheck, ArraySizeVal);
     StrSize->setAlignment(DL.getABIIntegerTypeAlignment(Ty->getIntegerBitWidth()));
-
 
     ArraySize = IRB.CreateLoad(Type::getInt32Ty(*C), ArraySizeVal);
     //ArraySize->setAlignment(DL.getABIIntegerTypeAlignment(ArraySize->getType()->getIntegerBitWidth()));
@@ -1755,13 +1872,21 @@ Value* AddressSanitizer::generateRecoverCode(Instruction* RecoverTerm, BasicBloc
     Value* ReallocCall = IRB.CreateCall(ReallocFunc, {ArrayAddr, MallocSize});
 
     Type* StartAddrTy = cast<PointerType>(StartAddr->getType())->getElementType();
-    if(StartAddrTy != Type::getInt8PtrTy(*C))
-    {
-      ReallocCall = IRB.CreateBitCast(ReallocCall, StartAddrTy);
-    }
+   
+
+    Value* ptrAddr = IRB.CreateGEP(IndicesArr, {selectVal, ConstantInt::get(Type::getInt32Ty(*C), 2)});
+    Value* ptrAddrVal = IRB.CreateLoad(PointerType::get(Type::getInt8PtrTy(*C), 0), ptrAddr);
     
-    IRB.CreateStore(ReallocCall, StartAddr);      //create the store
+    IRB.CreateStore(ReallocCall, ptrAddrVal);      //create the store
+    Args.pop_back();
+    Args.pop_back();
+    Args.push_back(IndicesArr);
+    Args.push_back(ConstantInt::get(Type::getInt32Ty(*C), oneLvlPointerCount));
+    Args.push_back(selectVal);
+    Args.push_back(ReallocCall);
+    IRB.CreateCall(setReallocFunc, ArrayRef<Value*>(Args));
     //Create the store for every pointer which is alias of the reallocated pointer
+    /*
     for(size_t i = 0;i < EqualPointers.size();i++) {
       for(auto *iter = EqualPointers[i].begin(); iter != EqualPointers[i].end(); iter++) {
         if(*iter == StartAddr) {
@@ -1774,7 +1899,7 @@ Value* AddressSanitizer::generateRecoverCode(Instruction* RecoverTerm, BasicBloc
         }
       }
     }
-    
+    */
     //StrArr->setAlignment(DL.getABIIntegerTypeAlignment(ReallocCall->getType()->getIntegerBitWidth()));
     ArrayAddr = IRB.CreateLoad(StartAddrTy, StartAddr);
     //ArrayAddr->setAlignment(DL.getABIIntegerTypeAlignment(ArrayAddr->getType()->getIntegerBitWidth()));
@@ -1788,7 +1913,7 @@ Value* AddressSanitizer::generateRecoverCode(Instruction* RecoverTerm, BasicBloc
     return ArrayIdx;
   }
   else {
-    //printf("Into READ\n");]
+    printf("Into READ\n");
     IRBuilder<> IRB(InsertBefore);
     // Recovery IR code generation for READ access
     Value* ArrayAddr = cast<LoadInst>(InsertBefore)->getPointerOperand();
@@ -2013,6 +2138,8 @@ bool ModuleAddressSanitizer::ShouldInstrumentGlobal(GlobalVariable *G) {
   if (G->isThreadLocal()) return false;
   // For now, just ignore this Global if the alignment is large.
   if (G->getAlignment() > MinRedzoneSizeForGlobal()) return false;
+  // Ignore globals created by Recover
+  if (G->getName().startswith(kAsanRecoverGlobalsName)) return false;
 
   // For non-COFF targets, only instrument globals known to be defined by this
   // TU.
@@ -2621,6 +2748,599 @@ int ModuleAddressSanitizer::GetAsanVersion(const Module &M) const {
   return Version;
 }
 
+void ModuleTrieFunctionsPass::CreateGetIndexFunction(Module &M, StructType* TrieNode, StructType* IndexElement) {
+
+  SmallVector<Type*, 2> Params;
+  SmallVector<Value*, 4> idxList;
+  LLVMContext *C = &(M.getContext());
+  Type* IntegerTy = Type::getInt32Ty(*C);
+  PointerType* TrieNodePtrTy = PointerType::get(TrieNode, 0);
+  Params.push_back(TrieNodePtrTy);
+  Params.push_back(Type::getInt8PtrTy(*C));
+  
+  FunctionType* getIndexFuncTy = FunctionType::get(Type::getInt32Ty(*C), ArrayRef<Type*>(Params),  false);
+  Function* getIndexFunc = Function::Create(getIndexFuncTy, GlobalValue::InternalLinkage, kAsanRecover + ".getIndex", M);
+
+  BasicBlock* entry = BasicBlock::Create(*C, "entry", getIndexFunc);
+  BasicBlock* for_body_preheader = BasicBlock::Create(*C, "for.body.preheader", getIndexFunc);
+  BasicBlock* for_cond = BasicBlock::Create(*C, "for.cond", getIndexFunc);
+  BasicBlock* for_body = BasicBlock::Create(*C, "for.body", getIndexFunc);
+  BasicBlock* if_then = BasicBlock::Create(*C, "if.then", getIndexFunc);
+  BasicBlock* if_else = BasicBlock::Create(*C, "if.else", getIndexFunc);
+  BasicBlock* if_then8 = BasicBlock::Create(*C, "if.then", getIndexFunc);
+  BasicBlock* if_else11 = BasicBlock::Create(*C, "if.else", getIndexFunc);
+  BasicBlock* if_then15 = BasicBlock::Create(*C, "if.then", getIndexFunc);
+  BasicBlock* if_else18 = BasicBlock::Create(*C, "if.else", getIndexFunc);
+  BasicBlock* if_end25 = BasicBlock::Create(*C, "if.end", getIndexFunc);
+  BasicBlock* for_end = BasicBlock::Create(*C, "for.end", getIndexFunc);
+  BasicBlock* cleanup = BasicBlock::Create(*C, "cleanup", getIndexFunc);
+
+  FunctionCallee isupperFunc = M.getOrInsertFunction("isupper", IntegerTy, IntegerTy);
+  FunctionCallee islowerFunc = M.getOrInsertFunction("islower", IntegerTy, IntegerTy);
+  Function::arg_iterator args = getIndexFunc->arg_begin();
+  Value* Head = args++;
+  //Head->setName("Head");
+  Value* str = args++;
+  //str->setName("str");
+
+  IRBuilder<> Inst(entry);
+  FunctionCallee strlenFunc = M.getOrInsertFunction("strlen", Type::getInt64Ty(*C), Type::getInt8PtrTy(*C));
+  Value* callInst = Inst.CreateCall(strlenFunc, {str}, "call");
+  Value* conv = Inst.CreateTrunc(callInst, Type::getInt32Ty(*C), "conv");
+  Value* cmp = Inst.CreateICmpSGT(conv, ConstantInt::get(Type::getInt32Ty(*C), 0), "cmp");
+  Inst.CreateCondBr(cmp, for_body_preheader, for_end);
+
+  Inst.SetInsertPoint(for_body_preheader);
+  Value* tripCount = Inst.CreateAnd(callInst, ConstantInt::get(Type::getInt64Ty(*C), 4294967295));
+  Inst.CreateBr(for_body);
+
+  Inst.SetInsertPoint(for_body);
+  PHINode* indvars = Inst.CreatePHI(Type::getInt64Ty(*C), 2, "indvars");
+  indvars->addIncoming(ConstantInt::get(Type::getInt64Ty(*C), 0), for_body_preheader);
+  PHINode* Crawl = Inst.CreatePHI(TrieNodePtrTy, 2, "Crawl");
+  Crawl->addIncoming(Head, for_body_preheader);
+  Value* arrayIdx = Inst.CreateGEP(str, indvars, "arrayidx");
+  LoadInst* arrayIdxVal = Inst.CreateLoad(Type::getInt8Ty(*C), arrayIdx);
+  Value* conv2 = Inst.CreateSExt(arrayIdxVal, IntegerTy, "conv2");
+  CallInst* call3 = Inst.CreateCall(isupperFunc, {conv2}, "call3");
+  Value* toBool = Inst.CreateICmpEQ(call3, ConstantInt::get(IntegerTy, 0), "tobool");
+  Inst.CreateCondBr(toBool, if_else, if_then);
+
+  Inst.SetInsertPoint(if_then);
+  Value* sub = Inst.CreateNSWAdd(conv2, ConstantInt::getSigned(IntegerTy, -65), "sub");
+  Inst.CreateBr(if_end25);
+
+  Inst.SetInsertPoint(if_else);
+  CallInst* call6 = Inst.CreateCall(islowerFunc, {conv2}, "call6");
+  Value* toBool7 = Inst.CreateICmpEQ(call6, ConstantInt::get(IntegerTy, 0), "tobool7");
+  Inst.CreateCondBr(toBool7, if_else11, if_then8);
+
+  Inst.SetInsertPoint(if_then8);
+  Value* sub10 = Inst.CreateNSWAdd(conv2, ConstantInt::getSigned(IntegerTy, -71), "sub10");
+  Inst.CreateBr(if_end25);
+
+  Inst.SetInsertPoint(if_else11);
+  Value* isdigitTmp = Inst.CreateNSWAdd(conv2, ConstantInt::getSigned(IntegerTy, -48), "isdigittmp");
+  Value* isdigit = Inst.CreateICmpULT(isdigitTmp, ConstantInt::get(IntegerTy, 10), "isdigit");
+  Inst.CreateCondBr(isdigit, if_then15, if_else18);
+
+  Inst.SetInsertPoint(if_then15);
+  Value* sub17 = Inst.CreateNSWAdd(conv2, ConstantInt::get(IntegerTy, 4));
+  Inst.CreateBr(if_end25);
+
+  Inst.SetInsertPoint(if_else18);
+  Value* cmp20 = Inst.CreateICmpEQ(arrayIdxVal, ConstantInt::get(Type::getInt8Ty(*C), 95));
+  Inst.CreateCondBr(cmp20, if_end25, cleanup);
+
+  Inst.SetInsertPoint(if_end25);
+  PHINode* offset1 = Inst.CreatePHI(IntegerTy, 4, "offset");
+  offset1->addIncoming(sub, if_then);
+  offset1->addIncoming(sub10, if_then8);
+  offset1->addIncoming(sub17, if_then15);
+  offset1->addIncoming(ConstantInt::get(IntegerTy, 62), if_else18);
+  Value* idxprom26 = Inst.CreateSExt(offset1, Type::getInt64Ty(*C), "idxprom");
+  idxList.push_back(ConstantInt::get(Type::getInt64Ty(*C), 0));
+  idxList.push_back(ConstantInt::get(IntegerTy, 0));
+  idxList.push_back(idxprom26);
+  Value* arrayidx = Inst.CreateGEP(Crawl, ArrayRef<Value*>(idxList), "arrayidx");
+  LoadInst* TrieNodeVal = Inst.CreateLoad(TrieNodePtrTy, arrayidx);
+  Value* toBool28 = Inst.CreateICmpEQ(TrieNodeVal, ConstantPointerNull::get(TrieNodePtrTy));
+  Value* indvars_next = Inst.CreateNSWAdd(indvars, ConstantInt::get(Type::getInt64Ty(*C), 1));
+  Inst.CreateCondBr(toBool28, cleanup, for_cond);
+
+  Inst.SetInsertPoint(for_cond);
+  Value* exitCond = Inst.CreateICmpEQ(indvars_next, tripCount);
+  Inst.CreateCondBr(exitCond, for_end, for_body);
+
+  indvars->addIncoming(indvars_next, for_cond);
+  Crawl->addIncoming(TrieNodeVal, for_cond);
+
+  Inst.SetInsertPoint(for_end);
+  PHINode* Crawl1 = Inst.CreatePHI(TrieNodePtrTy, 2, "Crawl");
+  Crawl1->addIncoming(Head, entry);
+  Crawl1->addIncoming(TrieNodeVal, for_cond);
+  idxList.pop_back();
+  idxList.pop_back();
+  idxList.push_back(ConstantInt::get(IntegerTy, 1));
+  Value* index = Inst.CreateGEP(Crawl1, ArrayRef<Value*>(idxList), "index");
+  LoadInst* indexVal = Inst.CreateLoad(IntegerTy, index);
+  Inst.CreateBr(cleanup);
+
+  Inst.SetInsertPoint(cleanup);
+  PHINode* retVal = Inst.CreatePHI(IntegerTy, 3, "retval");
+  retVal->addIncoming(indexVal, for_end);
+  retVal->addIncoming(ConstantInt::getSigned(IntegerTy, -1), if_else18);
+  retVal->addIncoming(ConstantInt::getSigned(IntegerTy, -1), if_end25);
+  Inst.CreateRet(retVal);
+  return;
+}
+
+
+void ModuleTrieFunctionsPass::CreateInsertTrieFunction(Module &M, StructType* TrieNode, StructType* IndexElement) {
+  SmallVector<Value*, 4> idxList;
+  SmallVector<Type*, 5> Params;
+  LLVMContext *C = &(M.getContext());
+  Type* IntegerTy = Type::getInt32Ty(*C);
+  PointerType* TrieNodePtrTy = PointerType::get(TrieNode, 0);
+  PointerType* IndexElmPtrTy = PointerType::get(IndexElement, 0);
+
+  Params.push_back(TrieNodePtrTy);
+  Params.push_back(Type::getInt8PtrTy(*C));
+  Params.push_back(Type::getInt32PtrTy(*C));
+  Params.push_back(IndexElmPtrTy);
+  Params.push_back(PointerType::get(Type::getInt8PtrTy(*C), 0));
+  FunctionType* insertFuncTy = FunctionType::get(Type::getVoidTy(*C), ArrayRef<Type*>(Params),  false);
+  Function* insertFunc = Function::Create(insertFuncTy, GlobalValue::InternalLinkage, kAsanRecover + ".insert", M);
+  //AttributeList AttrList = AttributeList::get(*C, 0, {"noinline", "nounwind", "ssp"});
+  //insertFunc->setAttributes(AttrList);
+
+  BasicBlock* entry = BasicBlock::Create(*C, "entry", insertFunc);
+  BasicBlock* for_body_preheader = BasicBlock::Create(*C, "for.body.preheader", insertFunc);
+  BasicBlock* for_body = BasicBlock::Create(*C, "for.body", insertFunc);
+  BasicBlock* if_then = BasicBlock::Create(*C, "if.then", insertFunc);
+  BasicBlock* if_else = BasicBlock::Create(*C, "if.else", insertFunc);
+  BasicBlock* if_then8 = BasicBlock::Create(*C, "if.then", insertFunc);
+  BasicBlock* if_else11 = BasicBlock::Create(*C, "if.else", insertFunc);
+  BasicBlock* if_then15 = BasicBlock::Create(*C, "if.then", insertFunc);
+  BasicBlock* if_else18 = BasicBlock::Create(*C, "if.else", insertFunc);
+  BasicBlock* if_end25 = BasicBlock::Create(*C, "if.end", insertFunc);
+  BasicBlock* if_then29 = BasicBlock::Create(*C, "if.then", insertFunc);
+  BasicBlock* if_end34 = BasicBlock::Create(*C, "if.end", insertFunc);
+  BasicBlock* for_cond_cleanup = BasicBlock::Create(*C, "for.cond.cleanup", insertFunc);
+
+  FunctionCallee isupperFunc = M.getOrInsertFunction("isupper", IntegerTy, IntegerTy);
+  FunctionCallee islowerFunc = M.getOrInsertFunction("islower", IntegerTy, IntegerTy);
+
+  Function::arg_iterator args = insertFunc->arg_begin();
+  Value* Head = args++;
+  //Head->setName("Head");
+  Value* str = args++;
+  //str->setName("str");
+  Value* index = args++;
+  //index->setName("index");
+  Value* Indices = args++;
+  //Indices->setName("Indices");
+  Value* ptrAddr = args++;
+  //ptrAddr->setName("ptrAddr");
+
+  IRBuilder<> Inst(entry);
+  FunctionCallee strlenFunc = M.getOrInsertFunction("strlen", Type::getInt64Ty(*C), Type::getInt8PtrTy(*C));
+  Value* callInst = Inst.CreateCall(strlenFunc, {str}, "call");
+  Value* conv = Inst.CreateTrunc(callInst, Type::getInt32Ty(*C), "conv");
+  Value* cmp = Inst.CreateICmpSGT(conv, ConstantInt::get(Type::getInt32Ty(*C), 0), "cmp");
+  Inst.CreateCondBr(cmp, for_body_preheader, for_cond_cleanup);
+
+  Inst.SetInsertPoint(for_body_preheader);
+  Value* tripCount = Inst.CreateAnd(callInst, ConstantInt::get(Type::getInt64Ty(*C), 4294967295));
+  Inst.CreateBr(for_body);
+
+  Inst.SetInsertPoint(for_cond_cleanup);
+  PHINode* crawl0 = Inst.CreatePHI(TrieNodePtrTy, 2, "Crawl");
+  crawl0->addIncoming(Head, entry);
+  LoadInst* ind = Inst.CreateLoad(IntegerTy, index);
+  idxList.push_back(ConstantInt::get(Type::getInt64Ty(*C), 0));
+  idxList.push_back(ConstantInt::get(Type::getInt32Ty(*C), 1));
+  Value* index38 = Inst.CreateGEP(crawl0, ArrayRef<Value*>(idxList), "index");
+  Inst.CreateStore(ind, index38);
+  Value* idxprom39 = Inst.CreateSExt(ind, Type::getInt64Ty(*C));
+  idxList.pop_back();
+  idxList.pop_back();
+  idxList.push_back(idxprom39);
+  idxList.push_back(ConstantInt::get(IntegerTy, 0));
+  Value* parentIdx = Inst.CreateGEP(Indices, ArrayRef<Value*>(idxList), "parentIndex");
+  Inst.CreateStore(ConstantInt::getSigned(IntegerTy, -2), parentIdx);
+  idxList.pop_back();
+  idxList.push_back(ConstantInt::get(IntegerTy, 1));
+  Value* size = Inst.CreateGEP(Indices, ArrayRef<Value*>(idxList), "size");
+  Inst.CreateStore(ConstantInt::get(IntegerTy, 0), size);
+  idxList.pop_back();
+  idxList.push_back(ConstantInt::get(IntegerTy, 2));
+  Value* ptrAddrIndices = Inst.CreateGEP(Indices, ArrayRef<Value*>(idxList), "ptrAddr");
+  Inst.CreateStore(ptrAddr, ptrAddrIndices);
+  Value* incIndex = Inst.CreateNSWAdd(ind, ConstantInt::get(IntegerTy, 1), "add");
+  Inst.CreateStore(incIndex, index);
+  Inst.CreateRetVoid();
+
+  Inst.SetInsertPoint(for_body);
+  PHINode* indvars = Inst.CreatePHI(Type::getInt64Ty(*C), 2, "indvars");
+  indvars->addIncoming(ConstantInt::get(Type::getInt64Ty(*C), 0), for_body_preheader);
+  PHINode* offset = Inst.CreatePHI(IntegerTy, 2, "offset");
+  offset->addIncoming(UndefValue::get(IntegerTy), for_body_preheader);
+  PHINode* Crawl = Inst.CreatePHI(TrieNodePtrTy, 2, "Crawl");
+  Crawl->addIncoming(Head, for_body_preheader);
+  Value* arrayIdx = Inst.CreateGEP(str, indvars, "arrayidx");
+  LoadInst* arrayIdxVal = Inst.CreateLoad(Type::getInt8Ty(*C), arrayIdx);
+  Value* conv2 = Inst.CreateSExt(arrayIdxVal, IntegerTy, "conv2");
+  CallInst* call3 = Inst.CreateCall(isupperFunc, {conv2}, "call3");
+  Value* toBool = Inst.CreateICmpEQ(call3, ConstantInt::get(IntegerTy, 0), "tobool");
+  Inst.CreateCondBr(toBool, if_else, if_then);
+  
+  Inst.SetInsertPoint(if_then);
+  Value* sub = Inst.CreateNSWAdd(conv2, ConstantInt::getSigned(IntegerTy, -65), "sub");
+  Inst.CreateBr(if_end25);
+
+  Inst.SetInsertPoint(if_else);
+  CallInst* call6 = Inst.CreateCall(islowerFunc, {conv2}, "call6");
+  Value* toBool7 = Inst.CreateICmpEQ(call6, ConstantInt::get(IntegerTy, 0), "tobool7");
+  Inst.CreateCondBr(toBool7, if_else11, if_then8);
+
+  Inst.SetInsertPoint(if_then8);
+  Value* sub10 = Inst.CreateNSWAdd(conv2, ConstantInt::getSigned(IntegerTy, -71), "sub10");
+  Inst.CreateBr(if_end25);
+
+  Inst.SetInsertPoint(if_else11);
+  Value* isdigitTmp = Inst.CreateNSWAdd(conv2, ConstantInt::getSigned(IntegerTy, -48), "isdigittmp");
+  Value* isdigit = Inst.CreateICmpULT(isdigitTmp, ConstantInt::get(IntegerTy, 10), "isdigit");
+  Inst.CreateCondBr(isdigit, if_then15, if_else18);
+
+  Inst.SetInsertPoint(if_then15);
+  Value* sub17 = Inst.CreateNSWAdd(conv2, ConstantInt::get(IntegerTy, 4));
+  Inst.CreateBr(if_end25);
+
+  Inst.SetInsertPoint(if_else18);
+  Value* cmp20 = Inst.CreateICmpEQ(arrayIdxVal, ConstantInt::get(Type::getInt8Ty(*C), 95));
+  Value* specSelect = Inst.CreateSelect(cmp20, ConstantInt::get(IntegerTy, 62), offset);
+  Inst.CreateBr(if_end25);
+
+  Inst.SetInsertPoint(if_end25);
+  PHINode* offset1 = Inst.CreatePHI(IntegerTy, 4, "offset");
+  offset1->addIncoming(sub, if_then);
+  offset1->addIncoming(sub10, if_then8);
+  offset1->addIncoming(sub17, if_then15);
+  offset1->addIncoming(specSelect, if_else18);
+  Value* idxprom26 = Inst.CreateSExt(offset1, Type::getInt64Ty(*C), "idxprom");
+  idxList.pop_back();
+  idxList.pop_back();
+  idxList.push_back(ConstantInt::get(Type::getInt64Ty(*C), 0));
+  idxList.push_back(ConstantInt::get(IntegerTy, 0));
+  idxList.push_back(idxprom26);
+  Value* arrayidx = Inst.CreateGEP(Crawl, ArrayRef<Value*>(idxList), "arrayidx");
+  LoadInst* TrieNodeVal = Inst.CreateLoad(TrieNodePtrTy, arrayidx);
+  Value* toBool28 = Inst.CreateICmpEQ(TrieNodeVal, ConstantPointerNull::get(TrieNodePtrTy));
+  Inst.CreateCondBr(toBool28, if_then29, if_end34);
+
+  /*
+  Inst.SetInsertPoint(if_then29);
+  FunctionCallee getNode = M.getOrInsertFunction(kAsanRecover + ".getNode", TrieNodePtrTy);
+  CallInst* call_i = Inst.CreateCall(getNode, ArrayRef<Value*>(llvm::NoneType::None), "call.i");
+  //Value* arrayIdxptr = Inst.CreateBitCast(arrayidx, PointerType::get(Type::getInt8PtrTy(*C), 0));
+  Inst.CreateStore(call_i, arrayidx);
+  Value* newNode = Inst.CreateBitCast(call_i, TrieNodePtrTy);
+  Inst.CreateBr(if_end34);
+*/
+  Inst.SetInsertPoint(if_then29);
+  FunctionCallee MallocFunc = M.getOrInsertFunction("malloc", Type::getInt8PtrTy(*C), Type::getInt64Ty(*C));
+  CallInst* call_i = Inst.CreateCall(MallocFunc, {ConstantInt::get(Type::getInt64Ty(*C), 512)});
+  SmallVector<Type*,2> IntrinsicTys;
+  IntrinsicTys.push_back(Type::getInt8PtrTy(*C));
+  IntrinsicTys.push_back(Type::getInt64Ty(*C));
+  Function* MemSetIntrinsic = Intrinsic::getDeclaration(&M, Intrinsic::memset, ArrayRef<Type*>(IntrinsicTys));
+  Inst.CreateCall(MemSetIntrinsic, {call_i,
+                                    ConstantInt::get(Type::getInt8Ty(*C), 0), 
+                                    ConstantInt::get(Type::getInt64Ty(*C), 504), 
+                                    ConstantInt::getFalse(Type::getInt1Ty(*C))});
+  Value* index_i = Inst.CreateGEP(call_i, ConstantInt::get(Type::getInt64Ty(*C), 504));
+  Value* indexIntTy = Inst.CreateBitCast(index_i, PointerType::get(IntegerTy, 0));
+  Inst.CreateStore(ConstantInt::getSigned(IntegerTy, -1), indexIntTy);
+  Value* arrayIdxptr = Inst.CreateBitCast(arrayidx, PointerType::get(Type::getInt8PtrTy(*C), 0));
+  Inst.CreateStore(call_i, arrayIdxptr);
+  Value* newNode = Inst.CreateBitCast(call_i, TrieNodePtrTy);
+  Inst.CreateBr(if_end34);
+
+  Inst.SetInsertPoint(if_end34);
+  PHINode* newNodeVal = Inst.CreatePHI(TrieNodePtrTy, 2);
+  newNodeVal->addIncoming(TrieNodeVal, if_end25);
+  newNodeVal->addIncoming(newNode, if_then29);
+  Value* indvars_next = Inst.CreateNSWAdd(indvars, ConstantInt::get(Type::getInt64Ty(*C), 1), "indvars.next");
+  Value* exitCond = Inst.CreateICmpEQ(indvars_next, tripCount);
+  Inst.CreateCondBr(exitCond, for_cond_cleanup, for_body);
+
+  indvars->addIncoming(indvars_next, if_end34);
+  offset->addIncoming(offset1, if_end34);
+  Crawl->addIncoming(newNodeVal, if_end34);
+  crawl0->addIncoming(newNodeVal, if_end34);
+  return;
+}
+
+void ModuleTrieFunctionsPass::CreateGetNodeFunction(Module &M, StructType* TrieNode) {
+  PointerType* TrieNodePtrTy = PointerType::get(TrieNode, 0);
+  LLVMContext *C = &(M.getContext());
+
+  FunctionType* getNodeTy = FunctionType::get(TrieNodePtrTy, ArrayRef<Type*>(llvm::NoneType::None),  false);
+  Function* getNode = Function::Create(getNodeTy, GlobalValue::InternalLinkage, kAsanRecover + ".getNode", M);
+  BasicBlock* entry = BasicBlock::Create(*C, "entry", getNode);
+
+  IRBuilder<> Inst(entry);
+  Type* IntegerTy = Type::getInt32Ty(*C);
+  FunctionCallee MallocFunc = M.getOrInsertFunction("malloc", Type::getInt8PtrTy(*C), Type::getInt64Ty(*C));
+  Value* call_i = Inst.CreateCall(MallocFunc, {ConstantInt::get(Type::getInt64Ty(*C), 512)});
+  SmallVector<Type*,2> IntrinsicTys;
+  IntrinsicTys.push_back(Type::getInt8PtrTy(*C));
+  IntrinsicTys.push_back(Type::getInt64Ty(*C));
+  Function* MemSetIntrinsic = Intrinsic::getDeclaration(&M, Intrinsic::memset, ArrayRef<Type*>(IntrinsicTys));
+  Inst.CreateCall(MemSetIntrinsic, {call_i,
+                                    ConstantInt::get(Type::getInt8Ty(*C), 0), 
+                                    ConstantInt::get(Type::getInt64Ty(*C), 504), 
+                                    ConstantInt::getFalse(Type::getInt1Ty(*C))});
+  Value* newNode = Inst.CreateBitCast(call_i, TrieNodePtrTy);
+  Value* index_i = Inst.CreateGEP(call_i, ConstantInt::get(Type::getInt64Ty(*C), 504));
+  Value* indexIntTy = Inst.CreateBitCast(index_i, PointerType::get(IntegerTy, 0));
+  Inst.CreateStore(ConstantInt::getSigned(IntegerTy, -1), indexIntTy);
+  Inst.CreateRet(newNode);
+  return;
+}
+
+void ModuleTrieFunctionsPass::CreateSetReallocFunction(Module &M, StructType* TrieNodeTy, StructType* IndexElementTy) {
+  PointerType* IndexElmPtrTy = PointerType::get(IndexElementTy, 0);
+  LLVMContext *C = &(M.getContext());
+  Type* IntegerTy = Type::getInt32Ty(*C);
+  SmallVector<Type*, 4> Params;
+  SmallVector<Value*, 3> idxList;
+
+  Params.push_back(IndexElmPtrTy);
+  Params.push_back(IntegerTy);
+  Params.push_back(IntegerTy);
+  Params.push_back(Type::getInt8PtrTy(*C));
+
+  FunctionType* setReallocTy = FunctionType::get(Type::getVoidTy(*C), ArrayRef<Type*>(Params), false);
+  Function* setReallocFunc = Function::Create(setReallocTy, GlobalValue::InternalLinkage, kAsanRecover + ".setRealloc", M);
+
+  BasicBlock* entry = BasicBlock::Create(*C, "entry", setReallocFunc);
+  BasicBlock* for_body_preheader = BasicBlock::Create(*C, "for.body.preheader", setReallocFunc);
+  BasicBlock* for_cond_cleanup = BasicBlock::Create(*C, "for.cond.cleanup", setReallocFunc);
+  BasicBlock* for_body = BasicBlock::Create(*C, "for.body", setReallocFunc);
+  BasicBlock* if_then = BasicBlock::Create(*C, "if.then", setReallocFunc);
+  BasicBlock* for_inc = BasicBlock::Create(*C, "for.inc", setReallocFunc);
+
+  Function::arg_iterator args = setReallocFunc->arg_begin();
+  Value* Indices = args++;
+  //Head->setName("Indices");
+  Value* ptrCount = args++;
+  //str->setName("ptrCount");
+  Value* val = args++;
+  //index->setName("val");
+  Value* newAddr = args++;
+  //Indices->setName("newAddr");
+
+  IRBuilder<> Inst(entry);
+  Value* isZero = Inst.CreateICmpSGT(ptrCount, ConstantInt::get(IntegerTy, 0));
+  Inst.CreateCondBr(isZero, for_body_preheader, for_cond_cleanup);
+
+  Inst.SetInsertPoint(for_body_preheader);
+  Value* tripCount = Inst.CreateZExt(ptrCount, Type::getInt64Ty(*C));
+  Inst.CreateBr(for_body);
+
+  Inst.SetInsertPoint(for_cond_cleanup);
+  Inst.CreateRetVoid();
+
+  Inst.SetInsertPoint(for_body);
+  PHINode* indvars = Inst.CreatePHI(Type::getInt64Ty(*C), 2);
+  indvars->addIncoming(ConstantInt::get(Type::getInt64Ty(*C), 0), for_body_preheader);
+  idxList.push_back(indvars);
+  idxList.push_back(ConstantInt::get(IntegerTy, 0));
+  Value* parentIndex = Inst.CreateGEP(Indices, ArrayRef<Value*>(idxList), "parentIndex");
+  Value* parentIdxVal = Inst.CreateLoad(IntegerTy, parentIndex);
+  Value* isEqual = Inst.CreateICmpEQ(parentIdxVal, val);
+  Inst.CreateCondBr(isEqual, if_then, for_inc);
+
+  Inst.SetInsertPoint(if_then);
+  idxList.pop_back();
+  idxList.push_back(ConstantInt::get(IntegerTy, 1));
+  Value* sizePtr = Inst.CreateGEP(Indices, ArrayRef<Value*>(idxList), "size");
+  Value* sizeVal = Inst.CreateLoad(IntegerTy, sizePtr);
+  Value* doubleSize = Inst.CreateShl(sizeVal, ConstantInt::get(IntegerTy, 1));
+  Inst.CreateStore(doubleSize, sizePtr); 
+  idxList.pop_back();
+  idxList.push_back(ConstantInt::get(IntegerTy, 2));
+  Value* ptrAddrPtr = Inst.CreateGEP(Indices, ArrayRef<Value*>(idxList), "ptrAddr");
+  Value* ptrAddr = Inst.CreateLoad(PointerType::get(Type::getInt8PtrTy(*C), 0), ptrAddrPtr);
+  Inst.CreateStore(newAddr, ptrAddr);
+  Inst.CreateBr(for_inc);
+
+  Inst.SetInsertPoint(for_inc);
+  Value* indvars_next = Inst.CreateAdd(indvars, ConstantInt::get(Type::getInt64Ty(*C), 1));
+  Value* exitCond = Inst.CreateICmpEQ(indvars_next, tripCount);
+  Inst.CreateCondBr(exitCond, for_cond_cleanup, for_body);
+
+  indvars->addIncoming(indvars_next, for_inc);
+  return;
+}
+
+void ModuleTrieFunctionsPass::CreateFreeFunction(Module &M, StructType* TrieNodeTy, StructType* IndexElementTy) {
+  SmallVector<Value*, 3> idxList;
+  SmallVector<Type*, 4> Params;
+  LLVMContext *C = &(M.getContext());
+  Type* IntegerTy = Type::getInt32Ty(*C);
+  PointerType* TrieNodePtrTy = PointerType::get(TrieNodeTy, 0);
+  PointerType* IndexElmPtrTy = PointerType::get(IndexElementTy, 0);
+
+  Params.push_back(TrieNodePtrTy);
+  Params.push_back(IndexElmPtrTy);
+  Params.push_back(IntegerTy);
+  Params.push_back(Type::getInt8PtrTy(*C));
+  
+  FunctionType* freeFuncTy = FunctionType::get(Type::getVoidTy(*C), ArrayRef<Type*>(Params),  false);
+  Function* freeFunc = Function::Create(freeFuncTy, GlobalValue::InternalLinkage, kAsanRecover + ".free", M);
+
+  BasicBlock* entry = BasicBlock::Create(*C, "entry", freeFunc);
+  BasicBlock* if_else = BasicBlock::Create(*C, "if.else", freeFunc);
+  BasicBlock* for_body_preheader = BasicBlock::Create(*C, "for.body.preheader", freeFunc);
+  BasicBlock* for_cond_cleanup = BasicBlock::Create(*C, "for.cond.cleanup", freeFunc);
+  BasicBlock* cleanup = BasicBlock::Create(*C, "cleanup", freeFunc);
+  BasicBlock* for_body = BasicBlock::Create(*C, "for.body", freeFunc);
+  BasicBlock* if_then = BasicBlock::Create(*C, "if.then", freeFunc);
+  BasicBlock* for_inc = BasicBlock::Create(*C, "for.inc", freeFunc);
+
+  Function::arg_iterator args = freeFunc->arg_begin();
+  Value* Head = args++;
+  //Head->setName("TrieHead");
+  Value* Indices = args++;
+  //str->setName("Indices");
+  Value* ptrCount = args++;
+  //index->setName("ptrCount");
+  Value* ptrName = args++;
+  //Indices->setName("ptrName");
+
+  FunctionCallee getIndexFunc = M.getOrInsertFunction("recvr.getIndex", Type::getInt32Ty(*C), TrieNodePtrTy, Type::getInt8PtrTy(*C));
+
+  IRBuilder<> Inst(entry);
+  Value* call = Inst.CreateCall(getIndexFunc, {Head, ptrName}, "call");
+  Value* idxprom = Inst.CreateSExt(call, Type::getInt64Ty(*C));
+  Value* parentIndex = Inst.CreateGEP(Indices, {idxprom, ConstantInt::get(IntegerTy, 0)});
+  Value* parentIndexVal = Inst.CreateLoad(IntegerTy, parentIndex);
+  Value* isfree = Inst.CreateICmpEQ(parentIndexVal, ConstantInt::getSigned(IntegerTy, -2));
+  Inst.CreateCondBr(isfree, cleanup, if_else);
+
+  Inst.SetInsertPoint(if_else);
+  Value* isAddrble = Inst.CreateICmpSGT(parentIndexVal, ConstantInt::getSigned(IntegerTy, -1));
+  Value* specSelect = Inst.CreateSelect(isAddrble, parentIndexVal, call);
+  Value* isZero = Inst.CreateICmpSGT(ptrCount, ConstantInt::get(IntegerTy, 0));
+  Inst.CreateCondBr(isZero, for_body_preheader, for_cond_cleanup);
+
+  Inst.SetInsertPoint(for_body_preheader);
+  Value* tripCount = Inst.CreateZExt(ptrCount, Type::getInt64Ty(*C));
+  Inst.CreateBr(for_body);
+
+  Inst.SetInsertPoint(for_body);
+  PHINode* indvars = Inst.CreatePHI(Type::getInt64Ty(*C), 2);
+  indvars->addIncoming(ConstantInt::get(Type::getInt64Ty(*C), 0), for_body_preheader);
+  idxList.push_back(indvars);
+  idxList.push_back(ConstantInt::get(IntegerTy, 0));
+  Value* parentIdx = Inst.CreateGEP(Indices, ArrayRef<Value*>(idxList), "parentIndex");
+  Value* parentIdxVal = Inst.CreateLoad(IntegerTy, parentIdx);
+  Value* isEqual = Inst.CreateICmpEQ(parentIdxVal, specSelect);
+  Inst.CreateCondBr(isEqual, if_then, for_inc);
+
+  Inst.SetInsertPoint(if_then);
+  Inst.CreateStore(ConstantInt::getSigned(IntegerTy, -2), parentIdx); 
+  idxList.pop_back();
+  idxList.push_back(ConstantInt::get(IntegerTy, 1));
+  Value* sizePtr = Inst.CreateGEP(Indices, ArrayRef<Value*>(idxList), "size");
+  Inst.CreateStore(ConstantInt::get(IntegerTy, 0), sizePtr); 
+  Inst.CreateBr(for_inc);
+
+  Inst.SetInsertPoint(for_inc);
+  Value* indvars_next = Inst.CreateAdd(indvars, ConstantInt::get(Type::getInt64Ty(*C), 1));
+  Value* exitCond = Inst.CreateICmpEQ(indvars_next, tripCount);
+  Inst.CreateCondBr(exitCond, for_cond_cleanup, for_body);
+
+  indvars->addIncoming(indvars_next, for_inc);
+
+  Inst.SetInsertPoint(for_cond_cleanup);
+  Value* idxprom1 = Inst.CreateSExt(specSelect, Type::getInt64Ty(*C));
+  Value* parentIndex2 = Inst.CreateGEP(Indices, {idxprom1, ConstantInt::get(IntegerTy, 0)});
+  Inst.CreateStore(ConstantInt::getSigned(IntegerTy, -2), parentIndex2);
+  Value* size2 = Inst.CreateGEP(Indices, {idxprom1, ConstantInt::get(IntegerTy, 1)});
+  Inst.CreateStore(ConstantInt::get(IntegerTy, 0), size2);
+  Value* ptrAddr = Inst.CreateGEP(Indices, {idxprom1, ConstantInt::get(IntegerTy, 2)});
+  Value* ptrAddrVal = Inst.CreateLoad(PointerType::get(Type::getInt8PtrTy(*C), 0), ptrAddr);
+  Value* ptrAddrValVal = Inst.CreateLoad(Type::getInt8PtrTy(*C), ptrAddrVal);
+  FunctionCallee libFreeFunc = M.getOrInsertFunction("free", Type::getVoidTy(*C), Type::getInt8PtrTy(*C));
+  Inst.CreateCall(libFreeFunc, {ptrAddrValVal});
+  Inst.CreateBr(cleanup);
+
+  Inst.SetInsertPoint(cleanup);
+  /*
+  PHINode* retVal = Inst.CreatePHI(Type::getInt1Ty(*C), 2, "retVal");
+  retVal->addIncoming(ConstantInt::getFalse(Type::getInt1Ty(*C)), for_cond_cleanup);
+  retVal->addIncoming(ConstantInt::getTrue(Type::getInt1Ty(*C)), entry);
+  */
+  Inst.CreateRetVoid();
+}
+
+void ModuleTrieFunctionsPass::CreateInitializeIndicesFunction(Module &M, StructType* TrieNodeTy, StructType* IndexElementTy) {
+  SmallVector<Value*, 3> idxList;
+  SmallVector<Type*, 2> Params;
+  LLVMContext *C = &(M.getContext());
+  Type* IntegerTy = Type::getInt32Ty(*C);
+  PointerType* IndexElmPtrTy = PointerType::get(IndexElementTy, 0);
+
+  Params.push_back(IndexElmPtrTy);
+  Params.push_back(IntegerTy);
+  
+  FunctionType* initFuncTy = FunctionType::get(Type::getVoidTy(*C), ArrayRef<Type*>(Params),  false);
+  Function* initFunc = Function::Create(initFuncTy, GlobalValue::InternalLinkage, kAsanRecover + ".initIndices", M);
+
+  BasicBlock* entry = BasicBlock::Create(*C, "entry", initFunc);
+  BasicBlock* for_body_preheader = BasicBlock::Create(*C, "for.body.preheader", initFunc);
+  BasicBlock* for_body = BasicBlock::Create(*C, "for.body", initFunc);
+  BasicBlock* for_inc = BasicBlock::Create(*C, "for.inc", initFunc);
+  BasicBlock* for_exit = BasicBlock::Create(*C, "for.exit", initFunc);
+
+  Function::arg_iterator args = initFunc->arg_begin();
+  Value* Indices = args++;
+  //str->setName("Indices");
+  Value* ptrCount = args++;
+  //index->setName("ptrCount");
+
+  IRBuilder<> Inst(entry);
+  Value* isZero = Inst.CreateICmpEQ(ptrCount, ConstantInt::get(IntegerTy, 0));
+  Inst.CreateCondBr(isZero, for_exit, for_body_preheader);
+
+  Inst.SetInsertPoint(for_body_preheader);
+  Value* tripCount = Inst.CreateZExt(ptrCount, Type::getInt64Ty(*C));
+  Inst.CreateBr(for_body);
+
+  Inst.SetInsertPoint(for_body);
+  PHINode* indvars = Inst.CreatePHI(Type::getInt64Ty(*C), 2);
+  indvars->addIncoming(ConstantInt::get(Type::getInt64Ty(*C), 0), for_body_preheader);
+  idxList.push_back(indvars);
+  idxList.push_back(ConstantInt::get(IntegerTy, 0));
+  Value* parentIdx = Inst.CreateGEP(Indices, ArrayRef<Value*>(idxList), "parentIndex");
+  Inst.CreateStore(ConstantInt::getSigned(IntegerTy, -2), parentIdx);
+  idxList.pop_back();
+  idxList.push_back(ConstantInt::get(IntegerTy, 1));
+  Value* sizePtr = Inst.CreateGEP(Indices, ArrayRef<Value*>(idxList), "size");
+  Inst.CreateStore(ConstantInt::get(IntegerTy, 0), sizePtr);
+  idxList.pop_back();
+  idxList.push_back(ConstantInt::get(IntegerTy, 2));
+  Value* ptrAddrPtr = Inst.CreateGEP(Indices, ArrayRef<Value*>(idxList), "ptrAddr");
+  Inst.CreateStore(ConstantPointerNull::get(PointerType::get(Type::getInt8PtrTy(*C), 0)), ptrAddrPtr);
+  Inst.CreateBr(for_inc);
+
+  Inst.SetInsertPoint(for_inc);
+  Value* indvars_next = Inst.CreateAdd(indvars, ConstantInt::get(Type::getInt64Ty(*C), 1));
+  Value* exitCond = Inst.CreateICmpEQ(indvars_next, tripCount);
+  Inst.CreateCondBr(exitCond, for_exit, for_body);
+
+  indvars->addIncoming(indvars_next, for_inc);
+
+  Inst.SetInsertPoint(for_exit);
+  Inst.CreateRetVoid();
+}
+
+void ModuleTrieFunctionsPass::createRecoverTypesnFuncs(Module &M) {
+  StructType* TrieNodeTy, *IndexElementTy;
+  InitializeRecoverStructTypes(M, &TrieNodeTy, &IndexElementTy, /* Write Mode */ 1);
+  CreateInitializeIndicesFunction(M, TrieNodeTy, IndexElementTy);
+  CreateSetReallocFunction(M, TrieNodeTy, IndexElementTy);
+  CreateGetNodeFunction(M, TrieNodeTy);
+  CreateInsertTrieFunction(M, TrieNodeTy, IndexElementTy);
+  CreateGetIndexFunction(M, TrieNodeTy, IndexElementTy);
+  CreateFreeFunction(M, TrieNodeTy, IndexElementTy);
+  return;
+}
+
 bool ModuleAddressSanitizer::instrumentModule(Module &M) {
   initializeCallbacks(M);
 
@@ -2660,7 +3380,6 @@ bool ModuleAddressSanitizer::instrumentModule(Module &M) {
     if (AsanDtorFunction)
       appendToGlobalDtors(M, AsanDtorFunction, Priority);
   }
-
   return true;
 }
 
@@ -2811,6 +3530,7 @@ bool AddressSanitizer::instrumentFunction(Function &F,
   if (F.getLinkage() == GlobalValue::AvailableExternallyLinkage) return false;
   if (!ClDebugFunc.empty() && ClDebugFunc == F.getName()) return false;
   if (F.getName().startswith("__asan_")) return false;
+  if (F.getName().startswith(kAsanRecover)) return false;
 
   bool FunctionModified = false;
 
@@ -2842,11 +3562,18 @@ bool AddressSanitizer::instrumentFunction(Function &F,
   SmallVector<Instruction *, 8> NoReturnCalls;
   SmallVector<BasicBlock *, 16> AllBlocks;
   SmallVector<Instruction *, 16> PointerComparisonsOrSubtracts;
+  SmallVector<AllocaInst*, 16> oneLvlPointerAllocas;
+  SmallVector<CallInst*, 8> arrayMallocAddrs;
+  SmallVector<StoreInst*, 8> oneLvlPointerAliases;
+  SmallVector<CallInst*, 8> freeInsts;
   int NumAllocas = 0;
   bool IsWrite;
   unsigned Alignment;
   uint64_t TypeSize;
+  oneLvlPointerCount = 0;
 
+  Instruction* lastAlloca = nullptr;
+  //printf("Instrument Function called\n");
   // Fill the set of memory operations to instrument.
   for (auto &BB : F) {
     AllBlocks.push_back(&BB);
@@ -2878,36 +3605,10 @@ bool AddressSanitizer::instrumentFunction(Function &F,
         continue;
       } else if(StoreInst* SI = dyn_cast<StoreInst>(&Inst)) {
         //WORKING ONLY FOR STRONG UPDATES
-        SI->getOperand(0);
+        Value* src = SI->getOperand(0);
         if(PointerType* srcPtrTy = dyn_cast<PointerType>(src->getType())) {   //Code to handle pointer aliasing of the array start address
-          if(!srcPtrTy->getElementType()->isPointerTy()) {                    // To not handle 2D pointer aliasing
-            Value* Dest = SI->getPointerOperand();
-            for(Use &U : SI->operands()) {
-              Value* v = U.get();
-              if(LoadInst* LI = dyn_cast<LoadInst>(v)) {                      //If the use is from a load instruction indicates its a pointer aliasing
-                Value* V = LI->getPointerOperand();
-                bool found = 0;
-                for(size_t i = 0; i < EqualPointers.size();i++) {             // Place the pointers aliased in a 2D vector to indicate they are the same
-                  for(auto it = EqualPointers[i].begin(); it != EqualPointers[i].end();it++) {
-                    if(*it == Dest) {                                         // Remove any past aliases of the same pointer in the 2D vector
-                      EqualPointers[i].erase(it);
-                      break;
-                    }
-                    else if(*it == V) {
-                      EqualPointers[i].push_back(Dest);
-                      found = 1;
-                      break;
-                    }
-                  }
-                }
-                if(!found) {
-                  SmallVector<Value*, 8> TempVec;
-                  TempVec.push_back(Dest);
-                  TempVec.push_back(V);
-                  EqualPointers.push_back(TempVec);
-                }
-              }
-            } 
+          if(!srcPtrTy->getElementType()->isPointerTy()  && !isa<ConstantPointerNull>(src)) {       // To not handle 2D pointer aliasing
+            oneLvlPointerAliases.push_back(SI);
           } 
         }
         continue;
@@ -2915,7 +3616,58 @@ bool AddressSanitizer::instrumentFunction(Function &F,
       else if (isa<MemIntrinsic>(Inst)) {
         // ok, take it.
       } else {
-        if (isa<AllocaInst>(Inst)) NumAllocas++;
+        if (isa<AllocaInst>(Inst)) {
+          NumAllocas++;
+          
+          AllocaInst* AI = dyn_cast<AllocaInst>(&Inst);
+          Type* AllocaTy = AI->getAllocatedType();
+          if(PointerType* AllocaPtrTy = dyn_cast<PointerType>(AllocaTy)) {
+            if(!AllocaPtrTy->getElementType()->isPointerTy()) {
+              oneLvlPointerAllocas.push_back(AI);
+              oneLvlPointerCount++;
+
+              Type* AllocatedTy = AllocaPtrTy->getElementType();
+              int primitiveSize = (AllocatedTy->getPrimitiveSizeInBits()).getFixedSize();
+              //Creating Garbage Pointers of different types
+              if(primitiveSize && (GarbageTypetoValue.find(AllocatedTy) == GarbageTypetoValue.end())) {
+                std::string name = "";
+                const DataLayout &DL = F.getParent()->getDataLayout();
+                Value* InitVal = NULL;
+
+                if(AllocatedTy == Type::getInt32Ty(*C)) {
+                  name = "i32";
+                  InitVal = ConstantInt::get(Type::getInt32Ty(*C), 0);
+                }
+                else if(AllocatedTy == Type::getInt64Ty(*C)) {
+                  name = "i64";
+                  InitVal = ConstantInt::get(Type::getInt64Ty(*C), 0);
+                }
+                else if(AllocatedTy == Type::getInt8Ty(*C)) {
+                  name = "i8";
+                  InitVal = ConstantInt::get(Type::getInt8Ty(*C), 0);
+                }
+                else if(AllocatedTy == Type::getFloatTy(*C)) {
+                  name = "float";
+                  InitVal = ConstantFP::get(Type::getFloatTy(*C), 0.0);
+                }
+                else if(AllocatedTy == Type::getDoubleTy(*C)) {
+                  name = "double";
+                  InitVal = ConstantFP::get(Type::getDoubleTy(*C), 0.0);
+                }
+
+                //Create the corresponding garbage pointer
+                IRBuilder<> IRB(AI); 
+                AllocaInst* Garbage_AI = IRB.CreateAlloca(AllocatedTy, nullptr, "garbage." + name);
+                Garbage_AI->setAlignment(DL.getABIIntegerTypeAlignment(primitiveSize));
+                //Store the null value of the specific type into the garbage value.
+                StoreInst* Garbage_SI = IRB.CreateStore(InitVal, Garbage_AI);
+                Garbage_SI->setAlignment(DL.getABIIntegerTypeAlignment(primitiveSize));
+                GarbageTypetoValue[AllocatedTy] = cast<Value>(Garbage_AI);
+              }
+            }
+          }
+          lastAlloca = &Inst;
+        }
         CallSite CS(&Inst);
         if (CS) {
           // A call inside BB.
@@ -2925,76 +3677,11 @@ bool AddressSanitizer::instrumentFunction(Function &F,
         }
         if (CallInst *CI = dyn_cast<CallInst>(&Inst)) {
           Function* F = CI->getCalledFunction();
-          if (F->getName() == "malloc") {                           //code to create size holders for dynamic allocations
-             const DataLayout &DL = F->getParent()->getDataLayout();
-             IRBuilder<> IRB(&Inst);
-             Type* Ty = IRB.getInt32Ty();
-             StringRef Name;
-             Value* ArrayAddr;
-             Instruction* II = &Inst;
-             while(II) {
-                for(User* U : II->users()) {                        //only one user is present
-                  if(StoreInst* SI = dyn_cast<StoreInst>(U)) {
-                    ArrayAddr = SI->getPointerOperand();            // A Value* to the start of the array
-                    Name = ArrayAddr->getName();                    // Name of the array
-                    II = NULL;
-                    break;
-                  }
-                  Instruction* UI = dyn_cast<Instruction>(U);
-                  II = UI;
-                }
-             }
-             AllocaInst* AI = IRB.CreateAlloca(Ty, nullptr, Name + ".size");      // Create an alloca for size holder
-             AI->setAlignment(DL.getABIIntegerTypeAlignment(Ty->getIntegerBitWidth()));
-             ArraytoArraySize[ArrayAddr] = dyn_cast<Value>(AI);       //Insert into map for retrieval
-             
-             Type* ArrayElementTy = NULL;
-             if(ConstantInt* MallocSizePtr = dyn_cast<ConstantInt>(CI->getArgOperand(0))) {
-              uint64_t MallocSize = MallocSizePtr->getZExtValue();
-              ArrayElementTy = ArrayAddr->getType()->getPointerElementType()->getPointerElementType();
-              uint64_t ArrayElementSize = DL.getTypeStoreSize(ArrayElementTy);
-
-              uint64_t ArraySize = MallocSize / ArrayElementSize;
-              StoreInst* SizeSI = IRB.CreateStore(ConstantInt::get(Ty,ArraySize),AI);
-              SizeSI->setAlignment(DL.getABIIntegerTypeAlignment(Ty->getIntegerBitWidth()));
-             }
-             //Should add code to handle if the array size is not a constant int
-
-             int primitiveSize = (ArrayElementTy->getPrimitiveSizeInBits()).getFixedSize();
-             //Creating Garbage Pointers of different types
-             if(primitiveSize && (GarbageTypetoValue.find(ArrayElementTy) == GarbageTypetoValue.end())) {
-               std::string name = "";
-               Value* InitVal = NULL;
-               
-               if(ArrayElementTy == Type::getInt32Ty(*C)) {
-                name = "i32";
-                InitVal = ConstantInt::get(Type::getInt32Ty(*C), 0);
-               }
-               else if(ArrayElementTy == Type::getInt64Ty(*C)) {
-                name = "i64";
-                InitVal = ConstantInt::get(Type::getInt64Ty(*C), 0);
-               }
-               else if(ArrayElementTy == Type::getInt8Ty(*C)) {
-                name = "i8";
-                InitVal = ConstantInt::get(Type::getInt8Ty(*C), 0);
-               }
-               else if(ArrayElementTy == Type::getFloatTy(*C)) {
-                name = "float";
-                InitVal = ConstantFP::get(Type::getFloatTy(*C), 0.0);
-               }
-               else if(ArrayElementTy == Type::getDoubleTy(*C)) {
-                name = "double";
-                InitVal = ConstantFP::get(Type::getDoubleTy(*C), 0.0);
-               }
-
-              //Create the corresponding garbage pointer 
-              AllocaInst* Garbage_AI = IRB.CreateAlloca(ArrayElementTy, nullptr, "garbage." + name);
-              Garbage_AI->setAlignment(DL.getABIIntegerTypeAlignment(primitiveSize));
-              //Store the null value of the specific type into the garbage value.
-              StoreInst* Garbage_SI = IRB.CreateStore(InitVal, Garbage_AI);
-              Garbage_SI->setAlignment(DL.getABIIntegerTypeAlignment(primitiveSize));
-              GarbageTypetoValue[ArrayElementTy] = cast<Value>(Garbage_AI);
-            }
+          if (F->getName() == "malloc") {                           
+            arrayMallocAddrs.push_back(CI);
+          }
+          else if(F->getName() == "free") {
+            freeInsts.push_back(CI);
           }
           maybeMarkSanitizerLibraryCallNoBuiltin(CI, TLI);
         }
@@ -3004,6 +3691,196 @@ bool AddressSanitizer::instrumentFunction(Function &F,
       NumInsnsPerBB++;
       if (NumInsnsPerBB >= ClMaxInsnsToInstrumentPerBB) break;
     }
+  }
+
+  Module* M = lastAlloca->getModule();
+  
+  //StructType* TrieNodeTy, *IndexElementTy;
+  InitializeRecoverStructTypes(*M, &TrieNodeTy, &IndexElementTy, /* Read mode */ 0);
+
+  PointerType* TrieNodePtrTy = PointerType::get(TrieNodeTy, 0);
+  PointerType* IndexElmPtrTy = PointerType::get(IndexElementTy, 0);
+  PointerType* twoLvlInt8PtrTy = PointerType::get(Type::getInt8PtrTy(*C), 0);
+
+  FunctionCallee initFunc = M->getOrInsertFunction(kAsanRecover + ".initIndices", Type::getVoidTy(*C), IndexElmPtrTy, Type::getInt32Ty(*C));
+  FunctionCallee getNodeFunc = M->getOrInsertFunction(kAsanRecover + ".getNode", TrieNodePtrTy);
+  FunctionCallee insertFunc = M->getOrInsertFunction(kAsanRecover + ".insert", Type::getVoidTy(*C), TrieNodePtrTy, Type::getInt8PtrTy(*C), Type::getInt32PtrTy(*C), IndexElmPtrTy, twoLvlInt8PtrTy);
+  FunctionCallee getIndexFunc = M->getOrInsertFunction(kAsanRecover + ".getIndex", Type::getInt32Ty(*C), TrieNodePtrTy, Type::getInt8PtrTy(*C));
+  FunctionCallee recvrFreeFunc = M->getOrInsertFunction(kAsanRecover + ".free", Type::getVoidTy(*C), TrieNodePtrTy, IndexElmPtrTy, Type::getInt32Ty(*C), Type::getInt8PtrTy(*C));
+
+
+  BasicBlock* firstBlock = &(F.getEntryBlock());
+  IRBuilder<> IRB(firstBlock->getFirstNonPHI());
+  //Create a new Node for TrieHead
+  TrieHead = IRB.CreateAlloca(/* Type */ TrieNodePtrTy, 
+                              /* AddrSpace */ 0, 
+                              /* ArraySize */ nullptr,
+                              /* Name */ kAsanRecover+".TrieHead" );
+  CallInst* newNode = IRB.CreateCall(getNodeFunc, ArrayRef<Value*>(llvm::NoneType::None), kAsanRecover + ".newTrieNode");
+  IRB.CreateStore(newNode, TrieHead);
+
+  //Creating Indices array for this function
+  IndicesArr = IRB.CreateAlloca(/* Type */ IndexElementTy, 
+                                /* ArraySize */ ConstantInt::get(Type::getInt64Ty(*C), oneLvlPointerCount), 
+                                /* Name */ kAsanRecover + ".Indices");
+  IRB.CreateCall(initFunc, {IndicesArr, ConstantInt::get(Type::getInt32Ty(*C), oneLvlPointerCount)});
+
+  //Create an integer "index" for storing next possible index
+  AllocaInst* indexInt = IRB.CreateAlloca(Type::getInt32Ty(*C), 0, nullptr, kAsanRecover + ".index");
+  IRB.CreateStore(ConstantInt::get(Type::getInt32Ty(*C), 0), indexInt);
+  
+  IRB.SetInsertPoint(lastAlloca->getNextNode());
+  SmallVector<Value*, 2> idxList;
+  idxList.push_back(ConstantInt::get(Type::getInt64Ty(*C), 0));
+  idxList.push_back(ConstantInt::get(Type::getInt64Ty(*C), 0));
+  LoadInst* TrieHeadVal = IRB.CreateLoad(TrieNodePtrTy, TrieHead);
+  for(auto Inst : oneLvlPointerAllocas) {
+    SmallVector<Value*, 5> Args;
+    Value* V = cast<Value>(Inst);
+    StringRef ptrName = V->getName();
+    if(V->getType() != twoLvlInt8PtrTy) {
+      V = IRB.CreateBitCast(V, twoLvlInt8PtrTy);
+    }
+    GlobalVariable* GV = createPrivateGlobalForString(*M, ptrName, true, "recvr.str");
+    Args.push_back(TrieHeadVal);
+    Value* PtrName = IRB.CreateGEP(GV, ArrayRef<Value*>(idxList));
+    Args.push_back(PtrName);
+    Args.push_back(indexInt);
+    Args.push_back(IndicesArr);
+    Args.push_back(V);
+    IRB.CreateCall(insertFunc, ArrayRef<Value*>(Args));
+    namesOfPointers[ptrName] = GV;
+  }
+
+  Type* IntegerTy = IRB.getInt32Ty();
+  for(auto Inst : arrayMallocAddrs) {
+    const DataLayout &DL = F.getParent()->getDataLayout();
+    IRB.SetInsertPoint(Inst);
+    Value* ArrayAddr;
+    Instruction* II = Inst;
+    while(II) {
+      for(User* U : II->users()) {                        //only one user is present
+        if(StoreInst* SI = dyn_cast<StoreInst>(U)) {
+          ArrayAddr = SI->getPointerOperand();            // A Value* to the start of the array
+          II = NULL;
+          break;
+        }
+        Instruction* UI = dyn_cast<Instruction>(U);
+        II = UI;
+      }
+    }
+    StringRef Name = ArrayAddr->getName();
+
+    Value* TrieHeadVal = IRB.CreateLoad(TrieNodePtrTy, TrieHead);
+    Value* PtrName = IRB.CreateGEP(namesOfPointers[Name], ArrayRef<Value*>(idxList));
+    Value* ptrIndex = IRB.CreateCall(getIndexFunc, {TrieHeadVal, PtrName});
+    Value* parentIndexptr = IRB.CreateGEP(IndicesArr, {ptrIndex, ConstantInt::get(IntegerTy, 0)});
+    IRB.CreateStore(ConstantInt::getSigned(IntegerTy, -1), parentIndexptr);
+    uint64_t ArraySize = 0;
+    Type* ArrayElementTy = NULL;
+    if(ConstantInt* MallocSizePtr = dyn_cast<ConstantInt>(Inst->getArgOperand(0))) {
+      uint64_t MallocSize = MallocSizePtr->getZExtValue();
+      ArrayElementTy = ArrayAddr->getType()->getPointerElementType()->getPointerElementType();
+      uint64_t ArrayElementSize = DL.getTypeStoreSize(ArrayElementTy);
+
+      ArraySize = MallocSize / ArrayElementSize;
+    }
+    //Should add code to handle if the array size is not a constant int
+
+    Value* sizeptr = IRB.CreateGEP(IndicesArr, {ptrIndex, ConstantInt::get(IntegerTy, 1)});
+    IRB.CreateStore(ConstantInt::get(IntegerTy, ArraySize), sizeptr);
+
+    //AllocaInst* AI = IRB.CreateAlloca(IntegerTy, nullptr, Name + ".size");      // Create an alloca for size holder
+    //AI->setAlignment(DL.getABIIntegerTypeAlignment(IntegerTy->getIntegerBitWidth()));
+
+    //ArraytoArraySize[ArrayAddr] = dyn_cast<Value>(AI);       //Insert into map for retrieval
+
+    //StoreInst* SizeSI = IRB.CreateStore(ConstantInt::get(IntegerTy,ArraySize),AI);
+    //SizeSI->setAlignment(DL.getABIIntegerTypeAlignment(IntegerTy->getIntegerBitWidth()));
+  }
+
+  for(auto SI : oneLvlPointerAliases) {
+    Value* lval = nullptr, *rval = nullptr;
+    bool isStaticPointerAlias = false;
+    lval = SI->getPointerOperand();
+    bool skipInst = false;
+    for(Use &U : SI->operands()) {
+      Value* v = U.get();
+      if(LoadInst* LI = dyn_cast<LoadInst>(v)) {                      //If the use is from a load instruction indicates its a pointer aliasing
+        rval = LI->getPointerOperand();
+        isStaticPointerAlias = false;
+        break;
+      }
+      else if(isa<AllocaInst>(v) || isa<IntToPtrInst>(v)) {         //For now, considering inttoptr insts also which may result due to function stack poisoning
+        isStaticPointerAlias = true;
+      }
+      else if(isa<CallInst>(v) || isa<BitCastInst>(v)) {
+        skipInst = true;
+        break;
+      }
+    }
+    //errs() << "skipInst" << skipInst << "\n";
+    if(skipInst)
+      continue;
+    if(lval) {
+      IRB.SetInsertPoint(SI);
+      StringRef lvalName = lval->getName();
+      Value* TrieHeadVal = IRB.CreateLoad(TrieNodePtrTy, TrieHead);
+      Value* lvalIndex = IRB.CreateCall(getIndexFunc, {TrieHeadVal, IRB.CreateGEP(namesOfPointers[lvalName], ArrayRef<Value*>(idxList))});
+      Value* lvalParentIndex = IRB.CreateGEP(IndicesArr, {lvalIndex, ConstantInt::get(IntegerTy, 0)});
+      Value* lvalSize = IRB.CreateGEP(IndicesArr, {lvalIndex, ConstantInt::get(IntegerTy, 1)});
+      if(isStaticPointerAlias) {
+        IRB.CreateStore(ConstantInt::getSigned(IntegerTy, -1), lvalParentIndex);
+        IRB.CreateStore(ConstantInt::get(IntegerTy, 0), lvalSize);
+      }
+      else if(rval) {
+        StringRef rvalName = rval->getName();
+        Value* rvalIndex = IRB.CreateCall(getIndexFunc, {TrieHeadVal, IRB.CreateGEP(namesOfPointers[rvalName], ArrayRef<Value*>(idxList))});
+        Value* rvalParentIndex = IRB.CreateGEP(IndicesArr, {rvalIndex, ConstantInt::get(IntegerTy, 0)});
+        Value* rvalPIVal = IRB.CreateLoad(IntegerTy, rvalParentIndex);
+        Value* isParent = IRB.CreateICmpEQ(rvalPIVal, ConstantInt::getSigned(IntegerTy, -1));
+        Value* storeVal = IRB.CreateSelect(isParent, rvalIndex, rvalPIVal);
+        IRB.CreateStore(storeVal, lvalParentIndex);
+        Value* rvalSize = IRB.CreateGEP(IndicesArr, {rvalIndex, ConstantInt::get(IntegerTy, 1)});
+        Value* rvalSizeVal = IRB.CreateLoad(IntegerTy, rvalSize);
+        IRB.CreateStore(rvalSizeVal, lvalSize);
+      }
+    }
+  }
+
+  for(auto Inst : freeInsts) {
+    //Value* freeOperand = Inst->getArgOperand(0);
+    Value* freePtr = nullptr;
+    Value* V = (Inst->getArgOperandUse(0)).get();
+    Instruction *II = dyn_cast<Instruction>(V);
+    LoadInst* LI = nullptr;
+    //while(II) {
+    if(isa<LoadInst>(II)) {
+      LI = dyn_cast<LoadInst>(II);
+      freePtr = LI->getPointerOperand(); 
+    }
+    else {
+      for(Use &U : II->operands()) { 
+        Value* v = U.get();
+        LI = dyn_cast<LoadInst>(v);                   
+        if(LI) {
+          freePtr = LI->getPointerOperand();            // A Value* to the pointer being freed
+          //II = NULL;
+          break;
+        }
+        II = dyn_cast<Instruction>(v);
+      }
+    }
+    //}
+    
+    IRB.SetInsertPoint(Inst);
+    StringRef ptrName = freePtr->getName();
+    Value* ptrNameAddr = IRB.CreateGEP(namesOfPointers[ptrName], ArrayRef<Value*>(idxList));
+    IRB.CreateCall(recvrFreeFunc, {TrieHeadVal, IndicesArr, ConstantInt::get(Type::getInt32Ty(*C), oneLvlPointerCount), ptrNameAddr});  
+    Inst->eraseFromParent();
+    if(!isa<LoadInst>(II))
+      II->eraseFromParent();
+    LI->eraseFromParent();
   }
 
   bool UseCalls =
