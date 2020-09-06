@@ -178,7 +178,7 @@ static const char *const kAsanShadowMemoryDynamicAddress =
 static const char *const kAsanAllocaPoison = "__asan_alloca_poison";
 static const char *const kAsanAllocasUnpoison = "__asan_allocas_unpoison";
 
-// Name for recover
+// Name for Asan recover mechanism
 static const std::string kAsanRecover = "recvr";
 // Name for globals created by recover
 static const char *const kAsanRecoverGlobalsName = "recvr.str";
@@ -677,6 +677,7 @@ private:
   Function *AsanDtorFunction = nullptr;
 };
 
+// This is a pass which words on each module adding the trie helper functions which help for ASAN recvr
 class ModuleTrieFunctionsPass : public ModulePass {
 public:
   static char ID;
@@ -740,6 +741,8 @@ private:
   bool UseOdrIndicator;
 };
 
+
+// Instrument the module with the Struct types for TrieNode and IndexElement Arrays.
 void InitializeRecoverStructTypes(Module &M, StructType** TrieNodeTyAddr, StructType** IndexElementTyAddr, bool writeMode) {
   SmallVector<Type*, 4> MemberTy;
   LLVMContext *C = &(M.getContext());
@@ -1726,6 +1729,8 @@ Instruction *AddressSanitizer::generateCrashCode(Instruction *InsertBefore,
   return Call;
 }
 
+// This function gives the indicies of a GetElementPtrInst,
+// Currently we are handling only GetElementPtrInsts with one index.
 Value* getArrayIndex(GetElementPtrInst* Inst) {
   if(isa<StructType>(Inst->getResultElementType())) {
     return NULL;                                                      //Don't intervene with struct getelementptr instructions
@@ -1737,6 +1742,10 @@ Value* getArrayIndex(GetElementPtrInst* Inst) {
   return NULL;
 }
 
+
+// This function inserts a PHI instruction before InsertBefore Inst such
+// that if the predecessor is the RecoverBlock, take the value ArrayIndex
+// else for every other predecessor, take the OriginalArrayIdx.
 void InsertPhiInst(Value* ArrayIdx, BasicBlock* RecoverBlock, Value* OriginalArrayIdx, Instruction* InsertBefore)
 {
   IRBuilder<> IRB(InsertBefore);
@@ -1756,6 +1765,7 @@ void InsertPhiInst(Value* ArrayIdx, BasicBlock* RecoverBlock, Value* OriginalArr
   return;
 }
 
+// This function does the recover mode instrumentation for a read/write access.
 Value* AddressSanitizer::generateRecoverCode(Instruction* RecoverTerm, BasicBlock* NextNextBlock, Instruction* InsertBefore, bool IsWrite) {
   Value* StartAddr = NULL, *index = NULL, *OriginalArrayIdx = NULL;
   
@@ -1780,6 +1790,7 @@ Value* AddressSanitizer::generateRecoverCode(Instruction* RecoverTerm, BasicBloc
         index = getArrayIndex(Inst);
       }
     }
+    // If either is not found with pointer analysis, cancel the instrumentation
     if(!OriginalArrayIdx || !StartAddr || !index)
         return NULL;
 
@@ -1885,21 +1896,6 @@ Value* AddressSanitizer::generateRecoverCode(Instruction* RecoverTerm, BasicBloc
     Args.push_back(selectVal);
     Args.push_back(ReallocCall);
     IRB.CreateCall(setReallocFunc, ArrayRef<Value*>(Args));
-    //Create the store for every pointer which is alias of the reallocated pointer
-    /*
-    for(size_t i = 0;i < EqualPointers.size();i++) {
-      for(auto *iter = EqualPointers[i].begin(); iter != EqualPointers[i].end(); iter++) {
-        if(*iter == StartAddr) {
-          for(auto it = EqualPointers[i].begin(); it != EqualPointers[i].end(); it++) {
-            if(*it != StartAddr) {
-              IRB.CreateStore(ReallocCall, *it);
-              break;
-            }
-          }
-        }
-      }
-    }
-    */
     //StrArr->setAlignment(DL.getABIIntegerTypeAlignment(ReallocCall->getType()->getIntegerBitWidth()));
     ArrayAddr = IRB.CreateLoad(StartAddrTy, StartAddr);
     //ArrayAddr->setAlignment(DL.getABIIntegerTypeAlignment(ArrayAddr->getType()->getIntegerBitWidth()));
@@ -2748,6 +2744,8 @@ int ModuleAddressSanitizer::GetAsanVersion(const Module &M) const {
   return Version;
 }
 
+
+// Helper function instrumenting the getIndex() function. The getIndex() function can be found in llvm-project/test.c
 void ModuleTrieFunctionsPass::CreateGetIndexFunction(Module &M, StructType* TrieNode, StructType* IndexElement) {
 
   SmallVector<Type*, 2> Params;
@@ -2875,7 +2873,7 @@ void ModuleTrieFunctionsPass::CreateGetIndexFunction(Module &M, StructType* Trie
   return;
 }
 
-
+// Helper function instrumenting the insert() function. The insert() function can be found in llvm-project/test.c
 void ModuleTrieFunctionsPass::CreateInsertTrieFunction(Module &M, StructType* TrieNode, StructType* IndexElement) {
   SmallVector<Value*, 4> idxList;
   SmallVector<Type*, 5> Params;
@@ -3062,6 +3060,7 @@ void ModuleTrieFunctionsPass::CreateInsertTrieFunction(Module &M, StructType* Tr
   return;
 }
 
+// Helper function instrumenting the getNode() function. The getNode() function can be found in llvm-project/test.c
 void ModuleTrieFunctionsPass::CreateGetNodeFunction(Module &M, StructType* TrieNode) {
   PointerType* TrieNodePtrTy = PointerType::get(TrieNode, 0);
   LLVMContext *C = &(M.getContext());
@@ -3090,6 +3089,7 @@ void ModuleTrieFunctionsPass::CreateGetNodeFunction(Module &M, StructType* TrieN
   return;
 }
 
+// Helper function instrumenting the setRealloc() function. The setRealloc() function can be found in llvm-project/test.c
 void ModuleTrieFunctionsPass::CreateSetReallocFunction(Module &M, StructType* TrieNodeTy, StructType* IndexElementTy) {
   PointerType* IndexElmPtrTy = PointerType::get(IndexElementTy, 0);
   LLVMContext *C = &(M.getContext());
@@ -3166,6 +3166,7 @@ void ModuleTrieFunctionsPass::CreateSetReallocFunction(Module &M, StructType* Tr
   return;
 }
 
+// Helper function instrumenting the free() function. The free() function can be found in llvm-project/test.c
 void ModuleTrieFunctionsPass::CreateFreeFunction(Module &M, StructType* TrieNodeTy, StructType* IndexElementTy) {
   SmallVector<Value*, 3> idxList;
   SmallVector<Type*, 4> Params;
@@ -3268,6 +3269,7 @@ void ModuleTrieFunctionsPass::CreateFreeFunction(Module &M, StructType* TrieNode
   Inst.CreateRetVoid();
 }
 
+// Helper function instrumenting the init() function. The init() function can be found in llvm-project/test.c
 void ModuleTrieFunctionsPass::CreateInitializeIndicesFunction(Module &M, StructType* TrieNodeTy, StructType* IndexElementTy) {
   SmallVector<Value*, 3> idxList;
   SmallVector<Type*, 2> Params;
@@ -3329,6 +3331,7 @@ void ModuleTrieFunctionsPass::CreateInitializeIndicesFunction(Module &M, StructT
   Inst.CreateRetVoid();
 }
 
+// Main function instrumenting all the helper types and helper functions necessary for ASAN recvr.
 void ModuleTrieFunctionsPass::createRecoverTypesnFuncs(Module &M) {
   StructType* TrieNodeTy, *IndexElementTy;
   InitializeRecoverStructTypes(M, &TrieNodeTy, &IndexElementTy, /* Write Mode */ 1);
@@ -3530,6 +3533,7 @@ bool AddressSanitizer::instrumentFunction(Function &F,
   if (F.getLinkage() == GlobalValue::AvailableExternallyLinkage) return false;
   if (!ClDebugFunc.empty() && ClDebugFunc == F.getName()) return false;
   if (F.getName().startswith("__asan_")) return false;
+  // To skip instrumenting helper functions for Recvr
   if (F.getName().startswith(kAsanRecover)) return false;
 
   bool FunctionModified = false;
@@ -3573,7 +3577,6 @@ bool AddressSanitizer::instrumentFunction(Function &F,
   oneLvlPointerCount = 0;
 
   Instruction* lastAlloca = nullptr;
-  //printf("Instrument Function called\n");
   // Fill the set of memory operations to instrument.
   for (auto &BB : F) {
     AllBlocks.push_back(&BB);
@@ -3604,10 +3607,10 @@ bool AddressSanitizer::instrumentFunction(Function &F,
         PointerComparisonsOrSubtracts.push_back(&Inst);
         continue;
       } else if(StoreInst* SI = dyn_cast<StoreInst>(&Inst)) {
-        //WORKING ONLY FOR STRONG UPDATES
         Value* src = SI->getOperand(0);
         if(PointerType* srcPtrTy = dyn_cast<PointerType>(src->getType())) {   //Code to handle pointer aliasing of the array start address
           if(!srcPtrTy->getElementType()->isPointerTy()  && !isa<ConstantPointerNull>(src)) {       // To not handle 2D pointer aliasing
+            // Collecting one level pointer aliases along way
             oneLvlPointerAliases.push_back(SI);
           } 
         }
@@ -3626,6 +3629,8 @@ bool AddressSanitizer::instrumentFunction(Function &F,
               oneLvlPointerAllocas.push_back(AI);
               oneLvlPointerCount++;
 
+              // If a one level pointer alloca has been found, create the garbage pointer of
+              // that type to divert invalid reads.
               Type* AllocatedTy = AllocaPtrTy->getElementType();
               int primitiveSize = (AllocatedTy->getPrimitiveSizeInBits()).getFixedSize();
               //Creating Garbage Pointers of different types
@@ -3702,6 +3707,7 @@ bool AddressSanitizer::instrumentFunction(Function &F,
   PointerType* IndexElmPtrTy = PointerType::get(IndexElementTy, 0);
   PointerType* twoLvlInt8PtrTy = PointerType::get(Type::getInt8PtrTy(*C), 0);
 
+  // Pointers to the helper functions already created.
   FunctionCallee initFunc = M->getOrInsertFunction(kAsanRecover + ".initIndices", Type::getVoidTy(*C), IndexElmPtrTy, Type::getInt32Ty(*C));
   FunctionCallee getNodeFunc = M->getOrInsertFunction(kAsanRecover + ".getNode", TrieNodePtrTy);
   FunctionCallee insertFunc = M->getOrInsertFunction(kAsanRecover + ".insert", Type::getVoidTy(*C), TrieNodePtrTy, Type::getInt8PtrTy(*C), Type::getInt32PtrTy(*C), IndexElmPtrTy, twoLvlInt8PtrTy);
@@ -3711,7 +3717,7 @@ bool AddressSanitizer::instrumentFunction(Function &F,
 
   BasicBlock* firstBlock = &(F.getEntryBlock());
   IRBuilder<> IRB(firstBlock->getFirstNonPHI());
-  //Create a new Node for TrieHead
+  //Create a new Node for TrieHead in the first basicblock of the function
   TrieHead = IRB.CreateAlloca(/* Type */ TrieNodePtrTy, 
                               /* AddrSpace */ 0, 
                               /* ArraySize */ nullptr,
@@ -3719,7 +3725,7 @@ bool AddressSanitizer::instrumentFunction(Function &F,
   CallInst* newNode = IRB.CreateCall(getNodeFunc, ArrayRef<Value*>(llvm::NoneType::None), kAsanRecover + ".newTrieNode");
   IRB.CreateStore(newNode, TrieHead);
 
-  //Creating Indices array for this function
+  //Creating Indices array for this function in the first basicblock
   IndicesArr = IRB.CreateAlloca(/* Type */ IndexElementTy, 
                                 /* ArraySize */ ConstantInt::get(Type::getInt64Ty(*C), oneLvlPointerCount), 
                                 /* Name */ kAsanRecover + ".Indices");
@@ -3734,6 +3740,7 @@ bool AddressSanitizer::instrumentFunction(Function &F,
   idxList.push_back(ConstantInt::get(Type::getInt64Ty(*C), 0));
   idxList.push_back(ConstantInt::get(Type::getInt64Ty(*C), 0));
   LoadInst* TrieHeadVal = IRB.CreateLoad(TrieNodePtrTy, TrieHead);
+  // Create string globals for each of the one level pointer names
   for(auto Inst : oneLvlPointerAllocas) {
     SmallVector<Value*, 5> Args;
     Value* V = cast<Value>(Inst);
@@ -3775,6 +3782,7 @@ bool AddressSanitizer::instrumentFunction(Function &F,
     Value* PtrName = IRB.CreateGEP(namesOfPointers[Name], ArrayRef<Value*>(idxList));
     Value* ptrIndex = IRB.CreateCall(getIndexFunc, {TrieHeadVal, PtrName});
     Value* parentIndexptr = IRB.CreateGEP(IndicesArr, {ptrIndex, ConstantInt::get(IntegerTy, 0)});
+    // Initialize the IndexElement index field with -1
     IRB.CreateStore(ConstantInt::getSigned(IntegerTy, -1), parentIndexptr);
     uint64_t ArraySize = 0;
     Type* ArrayElementTy = NULL;
@@ -3799,6 +3807,7 @@ bool AddressSanitizer::instrumentFunction(Function &F,
     //SizeSI->setAlignment(DL.getABIIntegerTypeAlignment(IntegerTy->getIntegerBitWidth()));
   }
 
+  // For each assignment operation in which lval is a one level pointer
   for(auto SI : oneLvlPointerAliases) {
     Value* lval = nullptr, *rval = nullptr;
     bool isStaticPointerAlias = false;
@@ -3819,9 +3828,9 @@ bool AddressSanitizer::instrumentFunction(Function &F,
         break;
       }
     }
-    //errs() << "skipInst" << skipInst << "\n";
     if(skipInst)
       continue;
+    // If not a pointer aliasing, then instrument the access like for a store access
     if(lval) {
       IRB.SetInsertPoint(SI);
       StringRef lvalName = lval->getName();
@@ -3848,6 +3857,7 @@ bool AddressSanitizer::instrumentFunction(Function &F,
     }
   }
 
+  // Divert all calls to free function to the helper recvr.free function which was created
   for(auto Inst : freeInsts) {
     //Value* freeOperand = Inst->getArgOperand(0);
     Value* freePtr = nullptr;
@@ -3873,6 +3883,7 @@ bool AddressSanitizer::instrumentFunction(Function &F,
     }
     //}
     
+    // Sync the Indicies array to mark the freed pointer as invalid.
     IRB.SetInsertPoint(Inst);
     StringRef ptrName = freePtr->getName();
     Value* ptrNameAddr = IRB.CreateGEP(namesOfPointers[ptrName], ArrayRef<Value*>(idxList));
